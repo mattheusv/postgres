@@ -770,6 +770,25 @@ OPTIONS (ADD password_required 'false');
       </listitem>
      </varlistentry>
 
+     <varlistentry>
+      <term><literal>use_scram_passthrough</literal> (<type>boolean</type>)</term>
+      <listitem>
+       <para>
+        This option controls whether <filename>postgres_fdw</filename> will use
+        the SCRAM password authentication to connect into the foreign server.
+        SCRAM secrets can only be used for logging into the foreign server if
+        the client authentication also uses SCRAM.
+      </para>
+      <para>
+        SCRAM authentication into the foreign server can only be possible if
+        both servers have identical SCRAM secrets (encrypted password) for the
+        user being used on <filename>postgres_fdw</filename> to authenticate on
+        the foreign server, same salt and iterations, not merely the same
+        password.
+      </para>
+      </listitem>
+     </varlistentry>
+
     </variablelist>
    </sect3>
  </sect2>

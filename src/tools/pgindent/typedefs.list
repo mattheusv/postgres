@@ -3599,6 +3599,7 @@ gzFile
 hashfunc
 hbaPort
 heap_page_items_state
+heapam_read_stream_next_block_private
 help_handler
 hlCheck
 hstoreCheckKeyLen_t

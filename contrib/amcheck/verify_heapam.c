@@ -23,8 +23,10 @@
 #include "catalog/pg_class.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/block.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
+#include "storage/read_stream.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
@@ -185,6 +187,44 @@ static XidBoundsViolation get_xid_status(TransactionId xid,
 										 HeapCheckContext *ctx,
 										 XidCommitStatus *status);
 
+struct heapam_read_stream_next_block_private
+{
+	BlockNumber current_blocknum;
+	BlockNumber last_exclusive;
+	SkipPages skip_option;
+	Relation rel;
+	Buffer *vmbuffer;
+};
+
+static BlockNumber
+heapam_read_stream_next_block(ReadStream *stream,
+							  void *callback_private_data,
+							  void *per_buffer_data)
+{
+	struct heapam_read_stream_next_block_private *p = callback_private_data;
+
+	/* Optionally skip over all-frozen or all-visible blocks */
+	if (p->skip_option != SKIP_PAGES_NONE)
+	{
+		for(; p->current_blocknum < p->last_exclusive; p->current_blocknum++)
+		{
+			int32 mapbts = visibilitymap_get_status(p->rel, p->current_blocknum,
+													p->vmbuffer);
+
+			if ((p->skip_option == SKIP_PAGES_ALL_FROZEN && (mapbts & VISIBILITYMAP_ALL_FROZEN) != 0) ||
+				(p->skip_option == SKIP_PAGES_ALL_VISIBLE && (mapbts & VISIBILITYMAP_ALL_VISIBLE) != 0))
+				continue;
+
+			break;
+		}
+	}
+
+	if (p->current_blocknum < p->last_exclusive)
+		return p->current_blocknum++;
+
+	return InvalidBlockNumber;
+}
+
 /*
  * Scan and report corruption in heap pages, optionally reconciling toasted
  * attributes with entries in the associated toast table.  Intended to be
@@ -231,6 +271,8 @@ verify_heapam(PG_FUNCTION_ARGS)
 	BlockNumber last_block;
 	BlockNumber nblocks;
 	const char *skip;
+	ReadStream *stream;
+	struct heapam_read_stream_next_block_private p;
 
 	/* Check supplied arguments */
 	if (PG_ARGISNULL(0))
@@ -404,7 +446,19 @@ verify_heapam(PG_FUNCTION_ARGS)
 	if (TransactionIdIsNormal(ctx.relfrozenxid))
 		ctx.oldest_xid = ctx.relfrozenxid;
 
-	for (ctx.blkno = first_block; ctx.blkno <= last_block; ctx.blkno++)
+	p.current_blocknum = first_block;
+	p.last_exclusive = last_block + 1;
+	p.skip_option = skip_option;
+	p.rel = ctx.rel;
+	p.vmbuffer = &vmbuffer;
+	stream = read_stream_begin_relation(READ_STREAM_SEQUENTIAL,
+										ctx.bstrategy,
+										ctx.rel,
+										MAIN_FORKNUM,
+										heapam_read_stream_next_block,
+										&p,
+										0);
+	while ((ctx.buffer = read_stream_next_buffer(stream, NULL)) != InvalidBuffer)
 	{
 		OffsetNumber maxoff;
 		OffsetNumber predecessor[MaxOffsetNumber];
@@ -417,30 +471,11 @@ verify_heapam(PG_FUNCTION_ARGS)
 
 		memset(predecessor, 0, sizeof(OffsetNumber) * MaxOffsetNumber);
 
-		/* Optionally skip over all-frozen or all-visible blocks */
-		if (skip_option != SKIP_PAGES_NONE)
-		{
-			int32		mapbits;
-
-			mapbits = (int32) visibilitymap_get_status(ctx.rel, ctx.blkno,
-													   &vmbuffer);
-			if (skip_option == SKIP_PAGES_ALL_FROZEN)
-			{
-				if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
-					continue;
-			}
-
-			if (skip_option == SKIP_PAGES_ALL_VISIBLE)
-			{
-				if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
-					continue;
-			}
-		}
-
-		/* Read and lock the next page. */
-		ctx.buffer = ReadBufferExtended(ctx.rel, MAIN_FORKNUM, ctx.blkno,
-										RBM_NORMAL, ctx.bstrategy);
+		/* Lock the next page. */
+		Assert(BufferIsValid(ctx.buffer));
 		LockBuffer(ctx.buffer, BUFFER_LOCK_SHARE);
+
+		ctx.blkno = BufferGetBlockNumber(ctx.buffer);
 		ctx.page = BufferGetPage(ctx.buffer);
 
 		/* Perform tuple checks */
@@ -798,6 +833,10 @@ verify_heapam(PG_FUNCTION_ARGS)
 		if (on_error_stop && ctx.is_corrupt)
 			break;
 	}
+	/* Ensure that the stream is completely read */
+	Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
+	Assert(p.current_blocknum == last_block + 1);
+	read_stream_end(stream);
 
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);

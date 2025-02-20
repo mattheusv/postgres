@@ -136,6 +136,82 @@ dblink_connect(text connname, text connstr) returns text
    </para>
   </refsect1>
 
+<refsect1>
+   <title>Foreign Data Wrapper</title>
+
+   <para>
+    A Foreign Data Wrapper can be used as a connection name parameter. The foreign
+    server can be created using CREATE SERVER and CREATE USER MAPPING commands. 
+   </para>
+
+   <para>
+    The authentication with the foreign server can be via password on USER
+    MAPPING or using SCRAM pass-through. The
+    <literal>use_scram_passthrough</literal> on CREATE SERVER options controls
+    whether <filename>dblink_fdw</filename> will use the SCRAM pass-through
+    authentication to connect to the foreign server. With SCRAM pass-through
+    authentication, <filename>dblink_fdw</filename> uses SCRAM-hashed secrets
+    instead of plain-text user passwords to connect to the remote server. This
+    avoids storing plain-text user passwords in PostgreSQL system catalogs.
+   </para>
+
+   <para>
+    To use SCRAM pass-through authentication:
+    <itemizedlist>
+     <listitem>
+      <para>
+       The remote server must request SCRAM authentication.  (If desired,
+       enforce this on the client side (FDW side) with the option
+       <literal>require_auth</literal>.)  If another authentication method is
+       requested by the server, then that one will be used normally.
+      </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      The remote server can be of any PostgreSQL version that supports SCRAM.
+      Support for <literal>use_scram_passthrough</literal> is only required on
+      the client side (FDW side).
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      The user mapping password is not used.  (It could be set to support other
+      authentication methods, but that would arguably violate the point of this
+      feature, which is to avoid storing plain-text passwords.)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+     The server running <filename>dblink_fdw</filename> and the remote server
+     must have identical SCRAM secrets (encrypted passwords) for the user being
+     used on <filename>dblink_fdw</filename> to authenticate on the foreign
+     server (same salt and iterations, not merely the same password).
+     </para>
+
+     <para>
+      As a corollary, if FDW connections to multiple hosts are to be made, for
+      example for partitioned foreign tables/sharding, then all hosts must have
+      identical SCRAM secrets for the users involved.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      The current session on the PostgreSQL instance that makes the outgoing FDW
+      connections also must also use SCRAM authentication for its incoming client
+      connection.  (Hence <quote>pass-through</quote>: SCRAM must be used going in
+      and out.) This is a technical requirement of the SCRAM protocol.
+     </para>
+    </listitem>
+    </itemizedlist>
+   </para>
+
+
+  </refsect1>
+
   <refsect1>
    <title>Notes</title>
 
@@ -181,8 +257,9 @@ SELECT dblink_connect('myconn', 'dbname=postgres options=-csearch_path=');
 (1 row)
 
 -- FOREIGN DATA WRAPPER functionality
--- Note: local connection must require password authentication for this to work properly
---       Otherwise, you will receive the following error from dblink_connect():
+-- Note: local connection that don't use SCRAM pass-through require password 
+--       authentication for this to work properly. Otherwise, you will receive
+--       the following error from dblink_connect():
 --       ERROR:  password is required
 --       DETAIL:  Non-superuser cannot connect if the server does not request a password.
 --       HINT:  Target server's authentication method must be changed.

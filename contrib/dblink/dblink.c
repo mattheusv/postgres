@@ -43,6 +43,8 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/defrem.h"
+#include "common/base64.h"
 #include "executor/spi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
@@ -112,9 +114,9 @@ static int	get_attnum_pk_pos(int *pkattnums, int pknumatts, int key);
 static HeapTuple get_tuple_of_interest(Relation rel, int *pkattnums, int pknumatts, char **src_pkattvals);
 static Relation get_rel_from_relname(text *relname_text, LOCKMODE lockmode, AclMode aclmode);
 static char *generate_relation_name(Relation rel);
-static void dblink_connstr_check(const char *connstr);
+static void dblink_connstr_check(const char *connstr, bool useScramPassthrough);
 static bool dblink_connstr_has_pw(const char *connstr);
-static void dblink_security_check(PGconn *conn, remoteConn *rconn, const char *connstr);
+static void dblink_security_check(PGconn *conn, remoteConn *rconn, const char *connstr, bool useScramPassthrough);
 static void dblink_res_error(PGconn *conn, const char *conname, PGresult *res,
 							 bool fail, const char *fmt,...) pg_attribute_printf(5, 6);
 static char *get_connect_string(ForeignServer *foreign_server, UserMapping *user_mapping);
@@ -128,6 +130,20 @@ static int	applyRemoteGucs(PGconn *conn);
 static void restoreLocalGucs(int nestlevel);
 
 static PGconn *connect_pg_server(char *connstr_or_srvname, remoteConn *rconn, uint32 wait_event_info);
+
+static bool
+			UseScramPassthrough(ForeignServer *foreign_server, UserMapping *user);
+
+static void
+			appendSCRAMKeysInfo(StringInfo buf);
+
+static bool
+			is_valid_dblink_fdw_option(const PQconninfoOption *options, const char *option,
+									   Oid context);
+
+
+static bool
+			dblink_connstr_has_scram_require_auth(const char *connstr);
 
 /* Global */
 static remoteConn *pconn = NULL;
@@ -1915,7 +1931,7 @@ dblink_fdw_validator(PG_FUNCTION_ARGS)
 	{
 		DefElem    *def = (DefElem *) lfirst(cell);
 
-		if (!is_valid_dblink_option(options, def->defname, context))
+		if (!is_valid_dblink_fdw_option(options, def->defname, context))
 		{
 			/*
 			 * Unknown option, or invalid option for the context specified, so
@@ -2547,14 +2563,55 @@ deleteConnection(const char *name)
 				 errmsg("undefined connection name")));
 }
 
+bool
+dblink_connstr_has_scram_require_auth(const char *connstr)
+{
+	PQconninfoOption *options;
+	PQconninfoOption *option;
+	bool		result = false;
+
+	options = PQconninfoParse(connstr, NULL);
+	if (options)
+	{
+		for (option = options; option->keyword != NULL; option++)
+		{
+			if (strcmp(option->keyword, "require_auth") == 0)
+			{
+				/*
+				 * Continue iterating even if we found to make sure that there
+				 * is no other declaration of require_auth that can overwrite
+				 * the first.
+				 */
+				if (option->val != NULL && strcmp(option->val, "scram-sha-256") == 0)
+					result = true;
+			}
+		}
+		PQconninfoFree(options);
+	}
+
+	return result;
+}
+
 /*
  * We need to make sure that the connection made used credentials
  * which were provided by the user, so check what credentials were
  * used to connect and then make sure that they came from the user.
  */
 static void
-dblink_security_check(PGconn *conn, remoteConn *rconn, const char *connstr)
+dblink_security_check(PGconn *conn, remoteConn *rconn, const char *connstr, bool useScramPassthrough)
 {
+
+	if (useScramPassthrough)
+	{
+		if (dblink_connstr_has_scram_require_auth(connstr))
+			return;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+				 errmsg("use_scram_passthrough can only be used with require_auth='scram-sha-256'"),
+				 errhint("Ensure that there is not invalid require_auth on foreign server or user mapping options")));
+	}
+
 	/* Superuser bypasses security check */
 	if (superuser())
 		return;
@@ -2615,16 +2672,29 @@ dblink_connstr_has_pw(const char *connstr)
 }
 
 /*
- * For non-superusers, insist that the connstr specify a password, except
- * if GSSAPI credentials have been delegated (and we check that they are used
- * for the connection in dblink_security_check later).  This prevents a
- * password or GSSAPI credentials from being picked up from .pgpass, a
- * service file, the environment, etc.  We don't want the postgres user's
- * passwords or Kerberos credentials to be accessible to non-superusers.
+ * For non-superusers, insist that the connstr specify a password, except if
+ * GSSAPI credentials have been delegated (and we check that they are used for
+ * the connection in dblink_security_check later) or if scram pass-through is
+ * being used.  This prevents a password or GSSAPI credentials from being
+ * picked up from .pgpass, a service file, the environment, etc.  We don't want
+ * the postgres user's passwords or Kerberos credentials to be accessible to
+ * non-superusers. In case of scram pass-through insist that the connstr
+ * specify require_auth=scram-sha-256 for a secure connection.
  */
 static void
-dblink_connstr_check(const char *connstr)
+dblink_connstr_check(const char *connstr, bool useScramPassthrough)
 {
+	if (useScramPassthrough)
+	{
+		if (dblink_connstr_has_scram_require_auth(connstr))
+			return;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+				 errmsg("use_scram_passthrough can only be used with require_auth='scram-sha-256'"),
+				 errhint("Ensure that there is not invalid require_auth on foreign server or user mapping options")));
+	}
+
 	if (superuser())
 		return;
 
@@ -2772,6 +2842,9 @@ get_connect_string(ForeignServer *foreign_server, UserMapping *user_mapping)
 	aclresult = object_aclcheck(ForeignServerRelationId, serverid, userid, ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, foreign_server->servername);
+
+	if (MyProcPort->has_scram_keys && UseScramPassthrough(foreign_server, user_mapping))
+		appendSCRAMKeysInfo(&buf);
 
 	foreach(cell, fdw->options)
 	{
@@ -2954,6 +3027,22 @@ is_valid_dblink_option(const PQconninfoOption *options, const char *option,
 	return true;
 }
 
+
+/*
+ * Same as is_valid_dblink_option but also check for only dblink_fdw specific
+ * options.
+ */
+static bool
+is_valid_dblink_fdw_option(const PQconninfoOption *options, const char *option,
+						   Oid context)
+{
+	if (strcmp(option, "use_scram_passthrough") == 0)
+		return true;
+
+	return is_valid_dblink_option(options, option, context);
+}
+
+
 /*
  * Copy the remote session's values of GUCs that affect datatype I/O
  * and apply them locally in a new GUC nesting level.  Returns the new
@@ -3025,6 +3114,70 @@ restoreLocalGucs(int nestlevel)
 }
 
 /*
+ * Append SCRAM client key and server key information from the global
+ * MyProcPort into the given StringInfo buffer.
+ */
+static void
+appendSCRAMKeysInfo(StringInfo buf)
+{
+	int			len;
+	int			encoded_len;
+	char	   *client_key;
+	char	   *server_key;
+
+
+	len = pg_b64_enc_len(sizeof(MyProcPort->scram_ClientKey));
+	/* don't forget the zero-terminator */
+	client_key = palloc0(len + 1);
+	encoded_len = pg_b64_encode((const char *) MyProcPort->scram_ClientKey,
+								sizeof(MyProcPort->scram_ClientKey),
+								client_key, len);
+	if (encoded_len < 0)
+		elog(ERROR, "could not encode SCRAM client key");
+
+	len = pg_b64_enc_len(sizeof(MyProcPort->scram_ServerKey));
+	/* don't forget the zero-terminator */
+	server_key = palloc0(len + 1);
+	encoded_len = pg_b64_encode((const char *) MyProcPort->scram_ServerKey,
+								sizeof(MyProcPort->scram_ServerKey),
+								server_key, len);
+	if (encoded_len < 0)
+		elog(ERROR, "could not encode SCRAM server key");
+
+	appendStringInfo(buf, "scram_client_key='%s'", client_key);
+	appendStringInfo(buf, "scram_server_key='%s'", server_key);
+	appendStringInfo(buf, "require_auth='scram-sha-256'");
+
+	pfree(client_key);
+	pfree(server_key);
+}
+
+
+static bool
+UseScramPassthrough(ForeignServer *foreign_server, UserMapping *user)
+{
+	ListCell   *cell;
+
+	foreach(cell, foreign_server->options)
+	{
+		DefElem    *def = lfirst(cell);
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			return defGetBoolean(def);
+	}
+
+	foreach(cell, user->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(cell);
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			return defGetBoolean(def);
+	}
+
+	return false;
+}
+
+/*
  * Connect to remote server. If connstr_or_srvname maps to a foreign server,
  * the associated properties and user mapping properties is also used to open
  * the connection. Otherwise a connection will be open using the raw
@@ -3040,6 +3193,7 @@ connect_pg_server(char *connstr_or_srvname, remoteConn *rconn, uint32 wait_event
 	Oid			serverid;
 	UserMapping *user_mapping;
 	Oid			userid = GetUserId();
+	bool		useScramPassthrough = false;
 
 	/* first gather the server connstr options */
 	srvname = pstrdup(connstr_or_srvname);
@@ -3050,13 +3204,15 @@ connect_pg_server(char *connstr_or_srvname, remoteConn *rconn, uint32 wait_event
 	{
 		serverid = foreign_server->serverid;
 		user_mapping = GetUserMapping(userid, serverid);
+		useScramPassthrough = MyProcPort->has_scram_keys && UseScramPassthrough(foreign_server, user_mapping);
 
 		connstr = get_connect_string(foreign_server, user_mapping);
 	}
 	else
 		connstr = connstr_or_srvname;
 
-	dblink_connstr_check(connstr);
+	/* Verify the set of connection parameters. */
+	dblink_connstr_check(connstr, useScramPassthrough);
 
 	/* OK to make connection */
 	conn = libpqsrv_connect(connstr, wait_event_info);
@@ -3075,7 +3231,8 @@ connect_pg_server(char *connstr_or_srvname, remoteConn *rconn, uint32 wait_event
 				 errdetail_internal("%s", msg)));
 	}
 
-	dblink_security_check(conn, rconn, connstr);
+	/* Perform post-connection security checks. */
+	dblink_security_check(conn, rconn, connstr, useScramPassthrough);
 
 	/* attempt to set client encoding to match server encoding, if needed */
 	if (PQclientEncoding(conn) != GetDatabaseEncoding())

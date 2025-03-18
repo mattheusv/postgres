@@ -61,14 +61,26 @@ set_dump_section(const char *arg, int *dumpSections)
 
 
 /* Register a callback to be run when exit_nicely is invoked. */
-void
+int
 on_exit_nicely(on_exit_nicely_callback function, void *arg)
 {
-	if (on_exit_nicely_index >= MAX_ON_EXIT_NICELY)
-		pg_fatal("out of on_exit_nicely slots");
-	on_exit_nicely_list[on_exit_nicely_index].function = function;
-	on_exit_nicely_list[on_exit_nicely_index].arg = arg;
+	set_on_exit_nicely_entry(function, arg, on_exit_nicely_index);
 	on_exit_nicely_index++;
+
+	return (on_exit_nicely_index - 1);
+}
+
+void
+set_on_exit_nicely_entry(on_exit_nicely_callback function, void *arg, int i)
+{
+	if (i >= MAX_ON_EXIT_NICELY)
+		pg_fatal("out of on_exit_nicely slots");
+
+	if (i > on_exit_nicely_index)
+		pg_fatal("no entry exists on %d index into on_exit_nicely slots", i);
+
+	on_exit_nicely_list[i].function = function;
+	on_exit_nicely_list[i].arg = arg;
 }
 
 /*

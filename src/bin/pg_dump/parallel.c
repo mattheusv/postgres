@@ -326,11 +326,18 @@ getThreadLocalPQExpBuffer(void)
  * pg_dump and pg_restore call this to register the cleanup handler
  * as soon as they've created the ArchiveHandle.
  */
-void
+int
 on_exit_close_archive(Archive *AHX)
 {
 	shutdown_info.AHX = AHX;
-	on_exit_nicely(archive_close_connection, &shutdown_info);
+	return on_exit_nicely(archive_close_connection, &shutdown_info);
+}
+
+void
+replace_on_exit_close_archive(Archive *AHX, int idx)
+{
+	shutdown_info.AHX = AHX;
+	set_on_exit_nicely_entry(archive_close_connection, &shutdown_info, idx);
 }
 
 /*

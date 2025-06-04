@@ -1842,7 +1842,6 @@ setNamespaceLateralState(List *namespace, bool lateral_only, bool lateral_ok)
 	}
 }
 
-
 /*
  * transformWhereClause -
  *	  Transform the qualification and make sure it is of type boolean.

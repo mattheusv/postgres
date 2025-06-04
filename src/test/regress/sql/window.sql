@@ -1522,6 +1522,64 @@ SELECT * FROM
    FROM empsalary) emp
 WHERE first_emp = 1 OR last_emp = 1;
 
+-- Test QUALIFY clause
+SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY RANK() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2;
+
+SELECT *,
+       ROW_NUMBER() OVER (PARTITION BY depname ORDER BY enroll_date DESC)
+FROM empsalary
+QUALIFY ROW_NUMBER() OVER (PARTITION BY depname ORDER BY enroll_date DESC) = 1;
+
+-- TODO(matheus): review this test case
+SELECT *,
+       AVG(salary) OVER (PARTITION BY depname) AS avg_salary
+FROM empsalary
+QUALIFY salary > AVG(salary) OVER (PARTITION BY depname) ;
+
+SELECT *,
+       COUNT(*) OVER (PARTITION BY depname, salary)
+FROM empsalary
+QUALIFY COUNT(*) OVER (PARTITION BY depname, salary) = 1;
+
+-- TODO(matheus): make it work with window function aliases
+/*
+SELECT *,
+       RANK() OVER (ORDER BY salary DESC) as rank
+FROM empsalary
+QUALIFY rank = 2;
+*/
+
+SELECT *,
+       ROW_NUMBER() OVER (PARTITION BY depname ORDER BY enroll_date)
+FROM empsalary
+QUALIFY ROW_NUMBER() OVER (PARTITION BY depname ORDER BY enroll_date) <= 3;
+
+SELECT *,
+       ROW_NUMBER() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY ROW_NUMBER() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2
+ORDER BY depname, salary DESC;
+
+-- TODO(matheus): Review all these tests that use AND/OR conditions
+SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY
+    RANK() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2
+    AND enroll_date > DATE '2007-01-01';
+
+SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY
+    RANK() OVER (PARTITION BY depname ORDER BY salary DESC) = 1
+    OR salary < 4000;
+
+-- TODO(matheus): Add test cases using multiple window functions
+
 -- cleanup
 DROP TABLE empsalary;
 

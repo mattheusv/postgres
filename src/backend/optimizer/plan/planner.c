@@ -4603,6 +4603,8 @@ create_one_window_path(PlannerInfo *root,
 	PathTarget *window_target;
 	ListCell   *l;
 	List	   *topqual = NIL;
+	WindowAggPath *windowAggPath;
+	Query	   *parse = root->parse;
 
 	/*
 	 * Since each window clause could require a different sort order, we stack
@@ -4740,11 +4742,15 @@ create_one_window_path(PlannerInfo *root,
 			}
 		}
 
-		path = (Path *)
-			create_windowagg_path(root, window_rel, path, window_target,
-								  wflists->windowFuncs[wc->winref],
-								  runcondition, wc,
-								  topwindow ? topqual : NIL, topwindow);
+		windowAggPath = create_windowagg_path(root, window_rel, path, window_target,
+											  wflists->windowFuncs[wc->winref],
+											  runcondition, wc,
+											  topwindow ? topqual : NIL, topwindow);
+
+		if (topwindow && parse->qualifyQual != NULL)
+			windowAggPath->qual = lappend(windowAggPath->qual, (Expr *) parse->qualifyQual);
+
+		path = (Path *) windowAggPath;
 	}
 
 	add_path(window_rel, path);

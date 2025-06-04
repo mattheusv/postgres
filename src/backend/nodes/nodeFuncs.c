@@ -2731,6 +2731,8 @@ query_tree_walker_impl(Query *query,
 		return true;
 	if (WALK(query->limitCount))
 		return true;
+	if (WALK(query->qualifyQual))
+		return true;
 
 	/*
 	 * Most callers aren't interested in SortGroupClause nodes since those
@@ -4372,6 +4374,8 @@ raw_expression_tree_walker_impl(Node *node,
 				if (WALK(stmt->larg))
 					return true;
 				if (WALK(stmt->rarg))
+					return true;
+				if (WALK(stmt->qualifyClause))
 					return true;
 			}
 			break;

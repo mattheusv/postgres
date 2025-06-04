@@ -222,6 +222,8 @@ typedef struct Query
 
 	List	   *windowClause;	/* a list of WindowClause's */
 
+	Node	   *qualifyQual;	/* qualifications applied to window functions  */
+
 	List	   *distinctClause; /* a list of SortGroupClause's */
 
 	List	   *sortClause;		/* a list of SortGroupClause's */
@@ -2190,6 +2192,7 @@ typedef struct SelectStmt
 	List	   *targetList;		/* the target list (of ResTarget) */
 	List	   *fromClause;		/* the FROM clause */
 	Node	   *whereClause;	/* WHERE qualification */
+	Node       *qualifyClause;	/* QUALIFY qualification */
 	List	   *groupClause;	/* GROUP BY clauses */
 	bool		groupDistinct;	/* Is this GROUP BY DISTINCT? */
 	Node	   *havingClause;	/* HAVING conditional-expression */

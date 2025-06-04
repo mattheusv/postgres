@@ -574,6 +574,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 		case EXPR_KIND_COPY_WHERE:
 		case EXPR_KIND_GENERATED_COLUMN:
 		case EXPR_KIND_CYCLE_MARK:
+		case EXPR_KIND_QUALIFY:
 			/* okay */
 			break;
 
@@ -1793,6 +1794,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		case EXPR_KIND_FROM_SUBSELECT:
 		case EXPR_KIND_FROM_FUNCTION:
 		case EXPR_KIND_WHERE:
+		case EXPR_KIND_QUALIFY:
 		case EXPR_KIND_POLICY:
 		case EXPR_KIND_HAVING:
 		case EXPR_KIND_FILTER:
@@ -3218,6 +3220,8 @@ ParseExprKindName(ParseExprKind exprKind)
 			return "GENERATED AS";
 		case EXPR_KIND_CYCLE_MARK:
 			return "CYCLE";
+		case EXPR_KIND_QUALIFY:
+			return "QUALIFY";
 
 			/*
 			 * There is intentionally no default: case here, so that the

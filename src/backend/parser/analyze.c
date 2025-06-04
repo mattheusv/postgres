@@ -1485,6 +1485,12 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 												   pstate->p_windowdefs,
 												   &qry->targetList);
 
+	qry->qualifyQual = transformWhereClause(pstate,
+											stmt->qualifyClause,
+											EXPR_KIND_QUALIFY,
+											"QUALIFY");
+
+
 	/* resolve any still-unresolved output columns as being type text */
 	if (pstate->p_resolve_unknowns)
 		resolveTargetListUnknowns(pstate, qry->targetList);

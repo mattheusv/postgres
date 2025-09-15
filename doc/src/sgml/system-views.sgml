@@ -601,6 +601,17 @@
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>location</structfield> <type>text</type>
+      </para>
+      <para>
+       The location where the extension was found based on the <link
+       linkend="guc-extension-control-path"><structname>extension_control_path</structname></link>
+       GUC. Only superusers can see the contents of this column.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>comment</structfield> <type>text</type>
       </para>
       <para>
@@ -720,6 +731,17 @@
       <para>
        Names of prerequisite extensions,
        or <literal>NULL</literal> if none
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>location</structfield> <type>text</type>
+      </para>
+      <para>
+       The location where the extension was found based on the <link
+       linkend="guc-extension-control-path"><structname>extension_control_path</structname></link>
+       GUC. Only superusers can see the contents of this column.
       </para></entry>
      </row>
 

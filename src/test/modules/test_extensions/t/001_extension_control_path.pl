@@ -25,6 +25,10 @@ my $ext_name2 = "test_custom_ext_paths_using_directory";
 mkpath("$ext_dir/$ext_name2");
 create_extension($ext_name2, $ext_dir, $ext_name2);
 
+# Make windows path use Unix slashes as canonicalize_path() is called when
+# collecting extension control paths. See get_extension_control_directories().
+my $ext_dir_canonicalized = $windows_os ? ($ext_dir =~ s/\\/\//gr) : $ext_dir;
+
 # Use the correct separator and escape \ when running on Windows.
 my $sep = $windows_os ? ";" : ":";
 $node->append_conf(
@@ -34,6 +38,10 @@ extension_control_path = '\$system$sep@{[ $windows_os ? ($ext_dir =~ s/\\/\\\\/g
 
 # Start node
 $node->start;
+
+# Create an user to test permissions to read extension locations.
+my $user = "user01";
+$node->safe_psql('postgres', "CREATE USER $user");
 
 my $ecp = $node->safe_psql('postgres', 'show extension_control_path;');
 
@@ -46,27 +54,45 @@ $node->safe_psql('postgres', "CREATE EXTENSION $ext_name2");
 my $ret = $node->safe_psql('postgres',
 	"select * from pg_available_extensions where name = '$ext_name'");
 is( $ret,
-	"test_custom_ext_paths|1.0|1.0|Test extension_control_path",
+	"test_custom_ext_paths|1.0|1.0|$ext_dir_canonicalized/extension|Test extension_control_path",
 	"extension is installed correctly on pg_available_extensions");
 
 $ret = $node->safe_psql('postgres',
 	"select * from pg_available_extension_versions where name = '$ext_name'");
 is( $ret,
-	"test_custom_ext_paths|1.0|t|t|f|t|||Test extension_control_path",
+	"test_custom_ext_paths|1.0|t|t|f|t|||$ext_dir_canonicalized/extension|Test extension_control_path",
 	"extension is installed correctly on pg_available_extension_versions");
 
 $ret = $node->safe_psql('postgres',
 	"select * from pg_available_extensions where name = '$ext_name2'");
 is( $ret,
-	"test_custom_ext_paths_using_directory|1.0|1.0|Test extension_control_path",
+	"test_custom_ext_paths_using_directory|1.0|1.0|$ext_dir_canonicalized/extension|Test extension_control_path",
 	"extension is installed correctly on pg_available_extensions");
 
 $ret = $node->safe_psql('postgres',
 	"select * from pg_available_extension_versions where name = '$ext_name2'"
 );
 is( $ret,
-	"test_custom_ext_paths_using_directory|1.0|t|t|f|t|||Test extension_control_path",
+	"test_custom_ext_paths_using_directory|1.0|t|t|f|t|||$ext_dir_canonicalized/extension|Test extension_control_path",
 	"extension is installed correctly on pg_available_extension_versions");
+
+# Test that a non-superuser can not read the extension location on
+# pg_available_extensions
+$ret = $node->safe_psql('postgres',
+	"select location from pg_available_extensions where name = '$ext_name2'",
+	connstr => "user=$user");
+is( $ret,
+	"<insufficient privilege>",
+	"extension location is hide on pg_available_extensions for insufficient privilege");
+
+# Test that a non-superuser can not read the extension location on
+# pg_available_extension_versions
+$ret = $node->safe_psql('postgres',
+	"select location from pg_available_extension_versions where name = '$ext_name2'",
+	connstr => "user=$user");
+is( $ret,
+	"<insufficient privilege>",
+	"extension location is hide on pg_available_extension_versions for insufficient privilege");
 
 # Ensure that extensions installed on $system is still visible when using with
 # custom extension control path.
@@ -75,7 +101,6 @@ $ret = $node->safe_psql('postgres',
 );
 is($ret, "t",
 	"\$system extension is installed correctly on pg_available_extensions");
-
 
 $ret = $node->safe_psql('postgres',
 	"set extension_control_path = ''; select count(*) > 0 as ok from pg_available_extensions where name = 'plpgsql'"

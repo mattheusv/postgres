@@ -3557,6 +3557,30 @@ get_tle_by_resno(List *tlist, AttrNumber resno)
 }
 
 /*
+ * Find the TargetEntry in the query's targetlist that matches the given Var node.
+ * Returns NULL if no matching TLE is found.
+ */
+TargetEntry *
+get_tle_by_var(List *tlist, Var *var)
+{
+	ListCell   *lc;
+
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (IsA((Node *) tle->expr, Var))
+		{
+			Var		   *tlistVar = (Var *) tle->expr;
+
+			if (var->varattno == tlistVar->varattno && var->varno == tlistVar->varno)
+				return tle;
+		}
+	}
+	return NULL;
+}
+
+/*
  * Given a Query and rangetable index, return relation's RowMarkClause if any
  *
  * Returns NULL if relation is not selected FOR UPDATE/SHARE

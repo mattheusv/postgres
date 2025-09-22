@@ -1578,6 +1578,20 @@ QUALIFY
     RANK() OVER (PARTITION BY depname ORDER BY salary DESC) = 1
     OR salary < 4000;
 
+-- Test QUALIFY clause pushdown's
+
+EXPLAIN(COSTS OFF) SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY
+    RANK() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2 AND depname = 'develop';
+SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY
+    RANK() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2 AND depname = 'develop';
+
+
 -- TODO(matheus): Add test cases using multiple window functions
 
 -- cleanup

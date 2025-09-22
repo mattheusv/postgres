@@ -150,7 +150,6 @@ static void check_output_expressions(Query *subquery,
 									 pushdown_safety_info *safetyInfo);
 static void compare_tlist_datatypes(List *tlist, List *colTypes,
 									pushdown_safety_info *safetyInfo);
-static bool targetIsInAllPartitionLists(TargetEntry *tle, Query *query);
 static pushdown_safe_type qual_is_pushdown_safe(Query *subquery, Index rti,
 												RestrictInfo *rinfo,
 												pushdown_safety_info *safetyInfo);
@@ -3848,7 +3847,7 @@ compare_tlist_datatypes(List *tlist, List *colTypes,
  * unlikely to be useful to spend any extra cycles getting it, since
  * unreferenced window definitions are probably infrequent in practice.
  */
-static bool
+bool
 targetIsInAllPartitionLists(TargetEntry *tle, Query *query)
 {
 	ListCell   *lc;

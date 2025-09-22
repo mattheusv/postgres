@@ -50,6 +50,8 @@ extern bool get_rte_attribute_is_dropped(RangeTblEntry *rte,
  */
 
 extern TargetEntry *get_tle_by_resno(List *tlist, AttrNumber resno);
+extern TargetEntry * get_tle_by_var(List *tlist, Var *var);
+
 
 /* ----------------
  *		FOR UPDATE/SHARE info

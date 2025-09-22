@@ -4661,6 +4661,35 @@ QUALIFY
  sales     |     1 |   5000 | 10-01-2006  |    1
 (4 rows)
 
+-- Test QUALIFY clause pushdown's
+EXPLAIN(COSTS OFF) SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY
+    RANK() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2 AND depname = 'develop';
+                         QUERY PLAN                         
+------------------------------------------------------------
+ WindowAgg
+   Window: w1 AS (ORDER BY salary ROWS UNBOUNDED PRECEDING)
+   Filter: (rank() OVER w1 <= 2)
+   ->  Sort
+         Sort Key: salary DESC
+         ->  Seq Scan on empsalary
+               Filter: ((depname)::text = 'develop'::text)
+(7 rows)
+
+SELECT *,
+       RANK() OVER (PARTITION BY depname ORDER BY salary DESC)
+FROM empsalary
+QUALIFY
+    RANK() OVER (PARTITION BY depname ORDER BY salary DESC) <= 2 AND depname = 'develop';
+ depname | empno | salary | enroll_date | rank 
+---------+-------+--------+-------------+------
+ develop |     8 |   6000 | 10-01-2006  |    1
+ develop |    10 |   5200 | 08-01-2007  |    2
+ develop |    11 |   5200 | 08-15-2007  |    2
+(3 rows)
+
 -- TODO(matheus): Add test cases using multiple window functions
 -- cleanup
 DROP TABLE empsalary;

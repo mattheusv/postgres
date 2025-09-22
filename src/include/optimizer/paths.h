@@ -275,4 +275,6 @@ extern PathKey *make_canonical_pathkey(PlannerInfo *root,
 extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 									List *live_childrels);
 
+extern bool targetIsInAllPartitionLists(TargetEntry *tle, Query *query);
+
 #endif							/* PATHS_H */

@@ -305,6 +305,50 @@ planner(Query *parse, const char *query_string, int cursorOptions,
 	return result;
 }
 
+static bool
+contain_windowfunc_clause_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, WindowFunc))
+		return true;
+
+	return expression_tree_walker(node, contain_windowfunc_clause_walker, context);
+}
+
+static bool
+contain_windowfunc_clause(Node *node)
+{
+	return contain_windowfunc_clause_walker(node, NULL);
+}
+
+static bool
+qual_is_in_partition_list_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Query	   *parse = (Query *) context;
+		Var		   *var = (Var *) node;
+		TargetEntry *tle;
+
+		tle = get_tle_by_var(parse->targetList, var);
+		if (tle != NULL)
+			return targetIsInAllPartitionLists(tle, parse);
+	}
+
+	return expression_tree_walker(node, qual_is_in_partition_list_walker, context);
+}
+
+static bool
+qual_is_in_partition_list(Query *parse, Node *qual)
+{
+	return qual_is_in_partition_list_walker(qual, parse);
+}
+
 PlannedStmt *
 standard_planner(Query *parse, const char *query_string, int cursorOptions,
 				 ParamListInfo boundParams)
@@ -667,6 +711,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse, PlannerInfo *parent_root,
 	bool		hasResultRTEs;
 	RelOptInfo *final_rel;
 	ListCell   *l;
+	List	   *newQualify;
 
 	/* Create a PlannerInfo data structure for this subquery */
 	root = makeNode(PlannerInfo);
@@ -1175,6 +1220,39 @@ subquery_planner(PlannerGlobal *glob, Query *parse, PlannerInfo *parent_root,
 		}
 	}
 	parse->havingQual = (Node *) newHaving;
+
+	newQualify = NIL;
+	parse->qualifyQual = preprocess_expression(root, parse->qualifyQual, EXPRKIND_QUAL);
+	if (parse->qualifyQual != NULL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, (List *) parse->qualifyQual)
+		{
+			Node	   *qual = (Node *) lfirst(lc);
+
+			if (qual_is_in_partition_list(parse, qual) && !contain_windowfunc_clause(qual))
+			{
+				Node	   *whereclause;
+
+				/* Preprocess the QUALIFY clause fully */
+				whereclause = preprocess_expression(root, qual, EXPRKIND_QUAL);
+
+				/* ... and move it to WHERE */
+				parse->jointree->quals = (Node *)
+					list_concat((List *) parse->jointree->quals,
+								(List *) whereclause);
+			}
+			else
+			{
+				/* Keep it in QUALIFY */
+				newQualify = lappend(newQualify, qual);
+			}
+		}
+	}
+	if (newQualify != NIL)
+		parse->qualifyQual = (Node *) newQualify;
+
 
 	/*
 	 * If we have any outer joins, try to reduce them to plain inner joins.
@@ -4748,7 +4826,8 @@ create_one_window_path(PlannerInfo *root,
 											  topwindow ? topqual : NIL, topwindow);
 
 		if (topwindow && parse->qualifyQual != NULL)
-			windowAggPath->qual = lappend(windowAggPath->qual, (Expr *) parse->qualifyQual);
+			windowAggPath->qual = (List *) make_and_qual((Node *) windowAggPath->qual, parse->qualifyQual);
+
 
 		path = (Path *) windowAggPath;
 	}

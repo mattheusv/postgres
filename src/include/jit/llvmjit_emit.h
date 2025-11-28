@@ -25,9 +25,9 @@
  * Emit a non-LLVM pointer as an LLVM constant.
  */
 static inline LLVMValueRef
-l_ptr_const(void *ptr, LLVMTypeRef type)
+l_ptr_const(void *ptr, LLVMTypeRef type, LLVMJitTypes *types)
 {
-	LLVMValueRef c = LLVMConstInt(TypeSizeT, (uintptr_t) ptr, false);
+	LLVMValueRef c = LLVMConstInt(types->TypeSizeT, (uintptr_t) ptr, false);
 
 	return LLVMConstIntToPtr(c, type);
 }
@@ -81,36 +81,36 @@ l_int64_const(LLVMContextRef lc, int64 i)
  * Emit constant integer.
  */
 static inline LLVMValueRef
-l_sizet_const(size_t i)
+l_sizet_const(LLVMJitTypes *types, size_t i)
 {
-	return LLVMConstInt(TypeSizeT, i, false);
+	return LLVMConstInt(types->TypeSizeT, i, false);
 }
 
 /*
  * Emit constant integer.
  */
 static inline LLVMValueRef
-l_datum_const(Datum i)
+l_datum_const(LLVMJitTypes *types, Datum i)
 {
-	return LLVMConstInt(TypeDatum, i, false);
+	return LLVMConstInt(types->TypeDatum, i, false);
 }
 
 /*
  * Emit constant boolean, as used for storage (e.g. global vars, structs).
  */
 static inline LLVMValueRef
-l_sbool_const(bool i)
+l_sbool_const(LLVMJitTypes *types, bool i)
 {
-	return LLVMConstInt(TypeStorageBool, (int) i, false);
+	return LLVMConstInt(types->TypeStorageBool, (int) i, false);
 }
 
 /*
  * Emit constant boolean, as used for parameters (e.g. function parameters).
  */
 static inline LLVMValueRef
-l_pbool_const(bool i)
+l_pbool_const(LLVMJitTypes *types, bool i)
 {
-	return LLVMConstInt(TypeParamBool, (int) i, false);
+	return LLVMConstInt(types->TypeParamBool, (int) i, false);
 }
 
 static inline LLVMValueRef
@@ -118,6 +118,7 @@ l_struct_gep(LLVMBuilderRef b, LLVMTypeRef t, LLVMValueRef v, int32 idx, const c
 {
 	return LLVMBuildStructGEP2(b, t, v, idx, "");
 }
+
 
 static inline LLVMValueRef
 l_gep(LLVMBuilderRef b, LLVMTypeRef t, LLVMValueRef v, LLVMValueRef *indices, int32 nindices, const char *name)
@@ -129,6 +130,32 @@ static inline LLVMValueRef
 l_load(LLVMBuilderRef b, LLVMTypeRef t, LLVMValueRef v, const char *name)
 {
 	return LLVMBuildLoad2(b, t, v, name);
+}
+
+/*
+ * Load value of a structure using offset of member in structure.
+ * b - builder
+ * v - value of structure
+ * dest - the type of the structure member
+ * offset - the offset of the structure member in the structure v
+ */
+static inline LLVMValueRef
+l_load_member_value_by_offset(LLVMBuilderRef b, LLVMContextRef lc, LLVMValueRef v, LLVMTypeRef dest, int offset)
+{
+    LLVMValueRef offsets = l_int32_const(lc, offset);
+    LLVMValueRef member_address = l_gep(b,(LLVMInt8TypeInContext(lc)), v, &offsets, 1, "member_address");
+    return l_load(b, dest, member_address, "member_value");
+}
+
+#define l_ptr_const_step(m,t) l_load_member_value_by_offset(b,lc, v_op, t, offsetof(ExprEvalStep ,m))
+
+
+static inline LLVMValueRef
+l_struct_member_ptr_by_offset(LLVMBuilderRef b, LLVMContextRef lc, LLVMValueRef v, int offset)
+{
+    LLVMValueRef offsets = l_int32_const(lc, offset);
+    LLVMValueRef member_address = l_gep(b,(LLVMInt8TypeInContext(lc)), v, &offsets, 1, "member_address");
+    return member_address;
 }
 
 static inline LLVMValueRef
@@ -241,15 +268,15 @@ l_callsite_alwaysinline(LLVMValueRef f)
  * Emit code to switch memory context.
  */
 static inline LLVMValueRef
-l_mcxt_switch(LLVMModuleRef mod, LLVMBuilderRef b, LLVMValueRef nc)
+l_mcxt_switch(LLVMModuleRef mod, LLVMBuilderRef b, LLVMValueRef nc, LLVMJitTypes *types)
 {
 	const char *cmc = "CurrentMemoryContext";
 	LLVMValueRef cur;
 	LLVMValueRef ret;
 
 	if (!(cur = LLVMGetNamedGlobal(mod, cmc)))
-		cur = LLVMAddGlobal(mod, l_ptr(StructMemoryContextData), cmc);
-	ret = l_load(b, l_ptr(StructMemoryContextData), cur, cmc);
+		cur = LLVMAddGlobal(mod, l_ptr(types->StructMemoryContextData), cmc);
+	ret = l_load(b, l_ptr(types->StructMemoryContextData), cur, cmc);
 	LLVMBuildStore(b, nc, cur);
 
 	return ret;
@@ -259,23 +286,23 @@ l_mcxt_switch(LLVMModuleRef mod, LLVMBuilderRef b, LLVMValueRef nc)
  * Return pointer to the argno'th argument nullness.
  */
 static inline LLVMValueRef
-l_funcnullp(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
+l_funcnullp(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno, LLVMJitTypes *types)
 {
 	LLVMValueRef v_args;
 	LLVMValueRef v_argn;
 
 	v_args = l_struct_gep(b,
-						  StructFunctionCallInfoData,
+						  types->StructFunctionCallInfoData,
 						  v_fcinfo,
 						  FIELDNO_FUNCTIONCALLINFODATA_ARGS,
 						  "");
 	v_argn = l_struct_gep(b,
-						  LLVMArrayType(StructNullableDatum, 0),
+						  LLVMArrayType(types->StructNullableDatum, 0),
 						  v_args,
 						  argno,
 						  "");
 	return l_struct_gep(b,
-						StructNullableDatum,
+						types->StructNullableDatum,
 						v_argn,
 						FIELDNO_NULLABLE_DATUM_ISNULL,
 						"");
@@ -285,23 +312,23 @@ l_funcnullp(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
  * Return pointer to the argno'th argument datum.
  */
 static inline LLVMValueRef
-l_funcvaluep(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
+l_funcvaluep(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno, LLVMJitTypes *types)
 {
 	LLVMValueRef v_args;
 	LLVMValueRef v_argn;
 
 	v_args = l_struct_gep(b,
-						  StructFunctionCallInfoData,
+						  types->StructFunctionCallInfoData,
 						  v_fcinfo,
 						  FIELDNO_FUNCTIONCALLINFODATA_ARGS,
 						  "");
 	v_argn = l_struct_gep(b,
-						  LLVMArrayType(StructNullableDatum, 0),
+						  LLVMArrayType(types->StructNullableDatum, 0),
 						  v_args,
 						  argno,
 						  "");
 	return l_struct_gep(b,
-						StructNullableDatum,
+						types->StructNullableDatum,
 						v_argn,
 						FIELDNO_NULLABLE_DATUM_DATUM,
 						"");
@@ -311,18 +338,18 @@ l_funcvaluep(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
  * Return argno'th argument nullness.
  */
 static inline LLVMValueRef
-l_funcnull(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
+l_funcnull(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno, LLVMJitTypes *types)
 {
-	return l_load(b, TypeStorageBool, l_funcnullp(b, v_fcinfo, argno), "");
+	return l_load(b, types->TypeStorageBool, l_funcnullp(b, v_fcinfo, argno, types), "");
 }
 
 /*
  * Return argno'th argument datum.
  */
 static inline LLVMValueRef
-l_funcvalue(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno)
+l_funcvalue(LLVMBuilderRef b, LLVMValueRef v_fcinfo, size_t argno, LLVMJitTypes *types)
 {
-	return l_load(b, TypeDatum, l_funcvaluep(b, v_fcinfo, argno), "");
+	return l_load(b, types->TypeDatum, l_funcvaluep(b, v_fcinfo, argno, types), "");
 }
 
 #endif							/* USE_LLVM */

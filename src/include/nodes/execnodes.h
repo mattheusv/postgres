@@ -106,6 +106,7 @@ typedef struct ExprState
 	/*
 	 * Instructions to compute expression's return value.
 	 */
+#define FIELDNO_EXPRSTATE_STEPS	5
 	struct ExprEvalStep *steps;
 
 	/*
@@ -278,6 +279,7 @@ typedef struct ExprContext
 
 	/* Memory contexts for expression evaluation --- see notes above */
 	MemoryContext ecxt_per_query_memory;
+#define FIELDNO_EXPRCONTEXT_PERTUPLEMEMORY 5
 	MemoryContext ecxt_per_tuple_memory;
 
 	/* Values to substitute for Param nodes in expression */
@@ -2545,6 +2547,7 @@ typedef struct AggState
 	AggStatePerTrans pertrans;	/* per-Trans state information */
 	ExprContext *hashcontext;	/* econtexts for long-lived data (hashtable) */
 	ExprContext **aggcontexts;	/* econtexts for long-lived data (per GS) */
+#define FIELDNO_AGGSTATE_TMPCONTEXT 13
 	ExprContext *tmpcontext;	/* econtext for input expressions */
 #define FIELDNO_AGGSTATE_CURAGGCONTEXT 14
 	ExprContext *curaggcontext; /* currently active aggcontext */

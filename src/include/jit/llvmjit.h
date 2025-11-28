@@ -40,6 +40,39 @@ extern "C"
 #include "jit/jit.h"
 #include "nodes/pg_list.h"
 
+/* type and struct definitions */
+typedef struct LLVMJitTypes
+{
+	LLVMTypeRef TypeParamBool;
+	LLVMTypeRef TypePGFunction;
+	LLVMTypeRef TypeSizeT;
+	LLVMTypeRef TypeDatum;
+	LLVMTypeRef TypeStorageBool;
+
+	LLVMTypeRef StructNullableDatum;
+	LLVMTypeRef StructTupleDescData;
+	LLVMTypeRef StructHeapTupleData;
+	LLVMTypeRef StructHeapTupleHeaderData;
+	LLVMTypeRef StructMinimalTupleData;
+	LLVMTypeRef StructTupleTableSlot;
+	LLVMTypeRef StructHeapTupleTableSlot;
+	LLVMTypeRef StructMinimalTupleTableSlot;
+	LLVMTypeRef StructMemoryContextData;
+	LLVMTypeRef StructFunctionCallInfoData;
+	LLVMTypeRef StructExprContext;
+	LLVMTypeRef StructExprEvalStep;
+	LLVMTypeRef StructExprState;
+	LLVMTypeRef StructAggState;
+	LLVMTypeRef StructAggStatePerTransData;
+	LLVMTypeRef StructAggStatePerGroupData;
+	LLVMTypeRef StructPlanState;
+	LLVMTypeRef StructWindowFuncExprState;
+
+	LLVMValueRef AttributeTemplate;
+	LLVMValueRef ExecEvalBoolSubroutineTemplate;
+	LLVMValueRef ExecEvalSubroutineTemplate;
+} LLVMJitTypes;
+
 typedef struct LLVMJitContext
 {
 	JitContext	base;
@@ -60,6 +93,13 @@ typedef struct LLVMJitContext
 	/* current, "open for write", module */
 	LLVMModuleRef module;
 
+	/* types module in llvm_context or NULL */
+	LLVMModuleRef llvm_types_module;
+
+	/* types defined in types module */
+	LLVMJitTypes *jit_types;
+
+
 	/* is there any pending code that needs to be emitted */
 	bool		compiled;
 
@@ -71,34 +111,8 @@ typedef struct LLVMJitContext
 } LLVMJitContext;
 
 /* type and struct definitions */
-extern PGDLLIMPORT LLVMTypeRef TypeParamBool;
-extern PGDLLIMPORT LLVMTypeRef TypePGFunction;
-extern PGDLLIMPORT LLVMTypeRef TypeSizeT;
-extern PGDLLIMPORT LLVMTypeRef TypeDatum;
-extern PGDLLIMPORT LLVMTypeRef TypeStorageBool;
 
-extern PGDLLIMPORT LLVMTypeRef StructNullableDatum;
-extern PGDLLIMPORT LLVMTypeRef StructTupleDescData;
-extern PGDLLIMPORT LLVMTypeRef StructHeapTupleData;
-extern PGDLLIMPORT LLVMTypeRef StructHeapTupleHeaderData;
-extern PGDLLIMPORT LLVMTypeRef StructMinimalTupleData;
-extern PGDLLIMPORT LLVMTypeRef StructTupleTableSlot;
-extern PGDLLIMPORT LLVMTypeRef StructHeapTupleTableSlot;
-extern PGDLLIMPORT LLVMTypeRef StructMinimalTupleTableSlot;
-extern PGDLLIMPORT LLVMTypeRef StructMemoryContextData;
-extern PGDLLIMPORT LLVMTypeRef StructFunctionCallInfoData;
-extern PGDLLIMPORT LLVMTypeRef StructExprContext;
-extern PGDLLIMPORT LLVMTypeRef StructExprEvalStep;
-extern PGDLLIMPORT LLVMTypeRef StructExprState;
-extern PGDLLIMPORT LLVMTypeRef StructAggState;
-extern PGDLLIMPORT LLVMTypeRef StructAggStatePerTransData;
-extern PGDLLIMPORT LLVMTypeRef StructAggStatePerGroupData;
-extern PGDLLIMPORT LLVMTypeRef StructPlanState;
-
-extern PGDLLIMPORT LLVMValueRef AttributeTemplate;
-extern PGDLLIMPORT LLVMValueRef ExecEvalBoolSubroutineTemplate;
-extern PGDLLIMPORT LLVMValueRef ExecEvalSubroutineTemplate;
-
+extern PGDLLIMPORT LLVMJitTypes llvm_jit_types;
 
 extern void llvm_enter_fatal_on_oom(void);
 extern void llvm_leave_fatal_on_oom(void);
@@ -111,14 +125,15 @@ extern LLVMModuleRef llvm_mutable_module(LLVMJitContext *context);
 extern char *llvm_expand_funcname(LLVMJitContext *context, const char *basename);
 extern void *llvm_get_function(LLVMJitContext *context, const char *funcname);
 extern void llvm_split_symbol_name(const char *name, char **modname, char **funcname);
-extern LLVMTypeRef llvm_pg_var_type(const char *varname);
-extern LLVMTypeRef llvm_pg_var_func_type(const char *varname);
-extern LLVMValueRef llvm_pg_func(LLVMModuleRef mod, const char *funcname);
+extern LLVMTypeRef llvm_pg_var_type(LLVMModuleRef llvm_types_module, const char *varname);
+extern LLVMTypeRef llvm_pg_var_func_type(LLVMJitContext *context, const char *varname);
+extern LLVMValueRef llvm_pg_func(LLVMJitContext *context, const char *funcname);
 extern void llvm_copy_attributes(LLVMValueRef from, LLVMValueRef to);
 extern LLVMValueRef llvm_function_reference(LLVMJitContext *context,
 						LLVMBuilderRef builder,
 						LLVMModuleRef mod,
-						FunctionCallInfo fcinfo);
+						FunctionCallInfo fcinfo,
+						LLVMValueRef v_fcinfo);
 
 extern void llvm_inline_reset_caches(void);
 extern void llvm_inline(LLVMModuleRef mod);

@@ -52,33 +52,10 @@ typedef struct LLVMJitHandle
 } LLVMJitHandle;
 
 
-/* types & functions commonly needed for JITing */
-LLVMTypeRef TypeSizeT;
-LLVMTypeRef TypeDatum;
-LLVMTypeRef TypeParamBool;
-LLVMTypeRef TypeStorageBool;
-LLVMTypeRef TypePGFunction;
-LLVMTypeRef StructNullableDatum;
-LLVMTypeRef StructHeapTupleData;
-LLVMTypeRef StructMinimalTupleData;
-LLVMTypeRef StructTupleDescData;
-LLVMTypeRef StructTupleTableSlot;
-LLVMTypeRef StructHeapTupleHeaderData;
-LLVMTypeRef StructHeapTupleTableSlot;
-LLVMTypeRef StructMinimalTupleTableSlot;
-LLVMTypeRef StructMemoryContextData;
-LLVMTypeRef StructFunctionCallInfoData;
-LLVMTypeRef StructExprContext;
-LLVMTypeRef StructExprEvalStep;
-LLVMTypeRef StructExprState;
-LLVMTypeRef StructAggState;
-LLVMTypeRef StructAggStatePerGroupData;
-LLVMTypeRef StructAggStatePerTransData;
-LLVMTypeRef StructPlanState;
-
-LLVMValueRef AttributeTemplate;
-LLVMValueRef ExecEvalSubroutineTemplate;
-LLVMValueRef ExecEvalBoolSubroutineTemplate;
+char	   *llvm_expand_funcname_internal(struct LLVMJitContext *context,
+										  const char *basename,
+										  int *counter);
+LLVMJitTypes llvm_jit_types;
 
 static LLVMModuleRef llvm_types_module = NULL;
 
@@ -100,6 +77,8 @@ static LLVMOrcThreadSafeContextRef llvm_ts_context;
 static LLVMOrcLLJITRef llvm_opt0_orc;
 static LLVMOrcLLJITRef llvm_opt3_orc;
 
+static void llvm_create_types_context(LLVMJitTypes *types,
+									  LLVMModuleRef *llvm_types_module, LLVMContextRef llvm_context);
 
 static void llvm_release_context(JitContext *context);
 static void llvm_session_initialize(void);
@@ -236,6 +215,8 @@ llvm_create_context(int jitFlags)
 	context = MemoryContextAllocZero(TopMemoryContext,
 									 sizeof(LLVMJitContext));
 	context->base.flags = jitFlags;
+	context->jit_types = &llvm_jit_types;
+	context->llvm_types_module = llvm_types_module;
 
 	/* ensure cleanup */
 	context->resowner = CurrentResourceOwner;
@@ -277,6 +258,12 @@ llvm_release_context(JitContext *context)
 		llvm_jit_context->module = NULL;
 	}
 
+	if (llvm_jit_context->llvm_context && llvm_jit_context->llvm_types_module)
+	{
+		LLVMDisposeModule(llvm_jit_context->llvm_types_module);
+		llvm_jit_context->llvm_types_module = NULL;
+	}
+
 	foreach(lc, llvm_jit_context->handles)
 	{
 		LLVMJitHandle *jit_handle = (LLVMJitHandle *) lfirst(lc);
@@ -308,6 +295,12 @@ llvm_release_context(JitContext *context)
 
 	if (llvm_jit_context->resowner)
 		ResourceOwnerForgetJIT(llvm_jit_context->resowner, llvm_jit_context);
+
+	if (llvm_jit_context->llvm_context)
+	{
+		LLVMContextDispose(llvm_context);
+		llvm_jit_context->llvm_context = NULL;
+	}
 }
 
 /*
@@ -325,7 +318,8 @@ llvm_mutable_module(LLVMJitContext *context)
 	{
 		context->compiled = false;
 		context->module_generation = llvm_generation++;
-		context->module = LLVMModuleCreateWithNameInContext("pg", llvm_context);
+		context->module = LLVMModuleCreateWithNameInContext("pg",
+															context->llvm_context ? context->llvm_context : llvm_context);
 		LLVMSetTarget(context->module, llvm_triple);
 		LLVMSetDataLayout(context->module, llvm_layout);
 	}
@@ -420,7 +414,7 @@ llvm_get_function(LLVMJitContext *context, const char *funcname)
  * in sync between plain C and JIT related code.
  */
 LLVMTypeRef
-llvm_pg_var_type(const char *varname)
+llvm_pg_var_type(LLVMModuleRef llvm_types_module, const char *varname)
 {
 	LLVMValueRef v_srcvar;
 	LLVMTypeRef typ;
@@ -440,12 +434,12 @@ llvm_pg_var_type(const char *varname)
  * keep function types in sync between C and JITed code.
  */
 LLVMTypeRef
-llvm_pg_var_func_type(const char *varname)
+llvm_pg_var_func_type(LLVMJitContext *context, const char *varname)
 {
 	LLVMValueRef v_srcvar;
 	LLVMTypeRef typ;
 
-	v_srcvar = LLVMGetNamedFunction(llvm_types_module, varname);
+	v_srcvar = LLVMGetNamedFunction(context->llvm_types_module, varname);
 	if (!v_srcvar)
 		elog(ERROR, "function %s not in llvmjit_types.c", varname);
 
@@ -462,22 +456,23 @@ llvm_pg_var_func_type(const char *varname)
  * the module that's currently being worked on.
  */
 LLVMValueRef
-llvm_pg_func(LLVMModuleRef mod, const char *funcname)
+llvm_pg_func(LLVMJitContext *context, const char *funcname)
 {
 	LLVMValueRef v_srcfn;
 	LLVMValueRef v_fn;
 
 	/* don't repeatedly add function */
-	v_fn = LLVMGetNamedFunction(mod, funcname);
+	v_fn = LLVMGetNamedFunction(context->module, funcname);
 	if (v_fn)
 		return v_fn;
 
-	v_srcfn = LLVMGetNamedFunction(llvm_types_module, funcname);
+	Assert(context->llvm_types_module != NULL);
+	v_srcfn = LLVMGetNamedFunction(context->llvm_types_module, funcname);
 
 	if (!v_srcfn)
 		elog(ERROR, "function %s not in llvmjit_types.c", funcname);
 
-	v_fn = LLVMAddFunction(mod,
+	v_fn = LLVMAddFunction(context->module,
 						   funcname,
 						   LLVMGetFunctionType(v_srcfn));
 	llvm_copy_attributes(v_srcfn, v_fn);
@@ -541,11 +536,14 @@ LLVMValueRef
 llvm_function_reference(LLVMJitContext *context,
 						LLVMBuilderRef builder,
 						LLVMModuleRef mod,
-						FunctionCallInfo fcinfo)
+						FunctionCallInfo fcinfo,
+						LLVMValueRef v_fcinfo)
 {
 	char	   *modname;
 	char	   *basename;
 	char	   *funcname;
+	LLVMJitTypes *types = context->jit_types;
+
 
 	LLVMValueRef v_fn;
 
@@ -574,17 +572,17 @@ llvm_function_reference(LLVMJitContext *context,
 							fcinfo->flinfo->fn_oid);
 		v_fn = LLVMGetNamedGlobal(mod, funcname);
 		if (v_fn != 0)
-			return l_load(builder, TypePGFunction, v_fn, "");
+			return l_load(builder, types->TypePGFunction, v_fn, "");
 
-		v_fn_addr = l_ptr_const(fcinfo->flinfo->fn_addr, TypePGFunction);
+		v_fn_addr = l_ptr_const(fcinfo->flinfo->fn_addr, types->TypePGFunction, types);
 
-		v_fn = LLVMAddGlobal(mod, TypePGFunction, funcname);
+		v_fn = LLVMAddGlobal(mod, types->TypePGFunction, funcname);
 		LLVMSetInitializer(v_fn, v_fn_addr);
 		LLVMSetGlobalConstant(v_fn, true);
 		LLVMSetLinkage(v_fn, LLVMPrivateLinkage);
 		LLVMSetUnnamedAddr(v_fn, true);
 
-		return l_load(builder, TypePGFunction, v_fn, "");
+		return l_load(builder, types->TypePGFunction, v_fn, "");
 	}
 
 	/* check if function already has been added */
@@ -592,7 +590,7 @@ llvm_function_reference(LLVMJitContext *context,
 	if (v_fn != 0)
 		return v_fn;
 
-	v_fn = LLVMAddFunction(mod, funcname, LLVMGetFunctionType(AttributeTemplate));
+	v_fn = LLVMAddFunction(mod, funcname, LLVMGetFunctionType(types->AttributeTemplate));
 
 	return v_fn;
 }
@@ -982,15 +980,15 @@ llvm_set_target(void)
 		llvm_layout = pstrdup(LLVMGetDataLayoutStr(llvm_types_module));
 }
 
+
 /*
  * Load required information, types, function signatures from llvmjit_types.c
- * and make them available in global variables.
- *
- * Those global variables are then used while emitting code.
+ * and save it in LLVMJitTypes struct.
  */
 static void
-llvm_create_types(void)
+llvm_create_types_context(LLVMJitTypes *types, LLVMModuleRef *llvm_types_module, LLVMContextRef llvm_context)
 {
+
 	char		path[MAXPGPATH];
 	LLVMMemoryBufferRef buf;
 	char	   *msg;
@@ -1005,38 +1003,59 @@ llvm_create_types(void)
 	}
 
 	/* eagerly load contents, going to need it all */
-	if (LLVMParseBitcodeInContext2(llvm_context, buf, &llvm_types_module))
+	if (LLVMParseBitcodeInContext2(llvm_context, buf, llvm_types_module))
 	{
 		elog(ERROR, "LLVMParseBitcodeInContext2 of %s failed", path);
 	}
 	LLVMDisposeMemoryBuffer(buf);
 
-	TypeSizeT = llvm_pg_var_type("TypeSizeT");
-	TypeDatum = llvm_pg_var_type("TypeDatum");
-	TypeParamBool = load_return_type(llvm_types_module, "FunctionReturningBool");
-	TypeStorageBool = llvm_pg_var_type("TypeStorageBool");
-	TypePGFunction = llvm_pg_var_type("TypePGFunction");
-	StructNullableDatum = llvm_pg_var_type("StructNullableDatum");
-	StructExprContext = llvm_pg_var_type("StructExprContext");
-	StructExprEvalStep = llvm_pg_var_type("StructExprEvalStep");
-	StructExprState = llvm_pg_var_type("StructExprState");
-	StructFunctionCallInfoData = llvm_pg_var_type("StructFunctionCallInfoData");
-	StructMemoryContextData = llvm_pg_var_type("StructMemoryContextData");
-	StructTupleTableSlot = llvm_pg_var_type("StructTupleTableSlot");
-	StructHeapTupleTableSlot = llvm_pg_var_type("StructHeapTupleTableSlot");
-	StructMinimalTupleTableSlot = llvm_pg_var_type("StructMinimalTupleTableSlot");
-	StructHeapTupleData = llvm_pg_var_type("StructHeapTupleData");
-	StructHeapTupleHeaderData = llvm_pg_var_type("StructHeapTupleHeaderData");
-	StructTupleDescData = llvm_pg_var_type("StructTupleDescData");
-	StructAggState = llvm_pg_var_type("StructAggState");
-	StructAggStatePerGroupData = llvm_pg_var_type("StructAggStatePerGroupData");
-	StructAggStatePerTransData = llvm_pg_var_type("StructAggStatePerTransData");
-	StructPlanState = llvm_pg_var_type("StructPlanState");
-	StructMinimalTupleData = llvm_pg_var_type("StructMinimalTupleData");
+	types->TypeSizeT = llvm_pg_var_type(*llvm_types_module, "TypeSizeT");
+	types->TypeDatum = llvm_pg_var_type(*llvm_types_module, "TypeDatum");
+	types->TypeParamBool = load_return_type(*llvm_types_module, "FunctionReturningBool");
+	types->TypeStorageBool = llvm_pg_var_type(*llvm_types_module, "TypeStorageBool");
+	types->TypePGFunction = llvm_pg_var_type(*llvm_types_module, "TypePGFunction");
+	types->StructNullableDatum = llvm_pg_var_type(*llvm_types_module, "StructNullableDatum");
+	types->StructExprContext = llvm_pg_var_type(*llvm_types_module, "StructExprContext");
+	types->StructExprEvalStep = llvm_pg_var_type(*llvm_types_module, "StructExprEvalStep");
+	types->StructExprState = llvm_pg_var_type(*llvm_types_module, "StructExprState");
+	types->StructFunctionCallInfoData = llvm_pg_var_type(*llvm_types_module, "StructFunctionCallInfoData");
+	types->StructMemoryContextData = llvm_pg_var_type(*llvm_types_module, "StructMemoryContextData");
+	types->StructTupleTableSlot = llvm_pg_var_type(*llvm_types_module, "StructTupleTableSlot");
+	types->StructHeapTupleTableSlot = llvm_pg_var_type(*llvm_types_module, "StructHeapTupleTableSlot");
+	types->StructMinimalTupleTableSlot = llvm_pg_var_type(*llvm_types_module, "StructMinimalTupleTableSlot");
+	types->StructHeapTupleData = llvm_pg_var_type(*llvm_types_module, "StructHeapTupleData");
+	types->StructHeapTupleHeaderData = llvm_pg_var_type(*llvm_types_module, "StructHeapTupleHeaderData");
+	types->StructTupleDescData = llvm_pg_var_type(*llvm_types_module, "StructTupleDescData");
+	types->StructAggState = llvm_pg_var_type(*llvm_types_module, "StructAggState");
+	types->StructAggStatePerGroupData = llvm_pg_var_type(*llvm_types_module, "StructAggStatePerGroupData");
+	types->StructAggStatePerTransData = llvm_pg_var_type(*llvm_types_module, "StructAggStatePerTransData");
+	types->StructPlanState = llvm_pg_var_type(*llvm_types_module, "StructPlanState");
+	types->StructMinimalTupleData = llvm_pg_var_type(*llvm_types_module, "StructMinimalTupleData");
+	types->StructWindowFuncExprState = llvm_pg_var_type(*llvm_types_module, "StructWindowFuncExprState");
 
-	AttributeTemplate = LLVMGetNamedFunction(llvm_types_module, "AttributeTemplate");
-	ExecEvalSubroutineTemplate = LLVMGetNamedFunction(llvm_types_module, "ExecEvalSubroutineTemplate");
-	ExecEvalBoolSubroutineTemplate = LLVMGetNamedFunction(llvm_types_module, "ExecEvalBoolSubroutineTemplate");
+	types->AttributeTemplate = LLVMGetNamedFunction(*llvm_types_module, "AttributeTemplate");
+	types->ExecEvalSubroutineTemplate = LLVMGetNamedFunction(*llvm_types_module, "ExecEvalSubroutineTemplate");
+	types->ExecEvalBoolSubroutineTemplate = LLVMGetNamedFunction(*llvm_types_module, "ExecEvalBoolSubroutineTemplate");
+
+	/* XXX(matheus): Why this? */
+	{
+		char	   *error = NULL;
+
+		LLVMVerifyModule(*llvm_types_module, LLVMAbortProcessAction, &error);
+		LLVMDisposeMessage(error);
+	}
+}
+
+/*
+ * Load required information, types, function signatures from llvmjit_types.c
+ * and make them available in global variables.
+ *
+ * Those global variables are then used while emitting code.
+ */
+static void
+llvm_create_types(void)
+{
+	llvm_create_types_context(&llvm_jit_types, &llvm_types_module, llvm_context);
 }
 
 /*

@@ -307,7 +307,9 @@ typedef struct ExprEvalStep
 	intptr_t	opcode;
 
 	/* where to store the result of this step */
+#define FIELDNO_EXPREVALSTEP_RESVALUE	1
 	Datum	   *resvalue;
+#define FIELDNO_EXPREVALSTEP_RESNULL	2
 	bool	   *resnull;
 
 	/*

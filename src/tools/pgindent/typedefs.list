@@ -1481,6 +1481,7 @@ LLVMIntPredicate
 LLVMJITEventListenerRef
 LLVMJitContext
 LLVMJitHandle
+LLVMJitTypes
 LLVMMemoryBufferRef
 LLVMModuleRef
 LLVMOrcCLookupSet

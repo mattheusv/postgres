@@ -1,4 +1,4 @@
-Parsed test spec with 7 sessions
+Parsed test spec with 9 sessions
 
 starting permutation: listenc notify1 notify2 notify3 notifyf
 step listenc: LISTEN c1; LISTEN c2;
@@ -247,3 +247,103 @@ nonzero
 t      
 (1 row)
 
+
+starting permutation: plisten_star pnotify_user_login pnotify_user_logout pnotify_user_empty pcheck
+step plisten_star: LISTEN 'user_*';
+step pnotify_user_login: NOTIFY user_login, 'login payload';
+step pnotify_user_logout: NOTIFY user_logout, 'logout payload';
+step pnotify_user_empty: NOTIFY user_, 'empty suffix';
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "user_login" with payload "login payload" from pattern_notifier
+pattern_listener: NOTIFY "user_logout" with payload "logout payload" from pattern_notifier
+pattern_listener: NOTIFY "user_" with payload "empty suffix" from pattern_notifier
+
+starting permutation: plisten_question pnotify_msg_1 pnotify_msg_a pnotify_msg_12 pcheck
+step plisten_question: LISTEN 'msg_?';
+step pnotify_msg_1: NOTIFY msg_1, 'message 1';
+step pnotify_msg_a: NOTIFY msg_a, 'message a';
+step pnotify_msg_12: NOTIFY msg_12, 'too long - should not match ?';
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "msg_1" with payload "message 1" from pattern_notifier
+pattern_listener: NOTIFY "msg_a" with payload "message a" from pattern_notifier
+
+starting permutation: plisten_complex pnotify_prefix_mid_suffix pnotify_prefix_suffix pnotify_prefix_a_b_suffix pcheck
+step plisten_complex: LISTEN 'prefix_*_suffix';
+step pnotify_prefix_mid_suffix: NOTIFY prefix_mid_suffix, 'complex match';
+step pnotify_prefix_suffix: NOTIFY prefix_suffix, 'no middle - should not match';
+step pnotify_prefix_a_b_suffix: NOTIFY prefix_a_b_suffix, 'multi char middle';
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "prefix_mid_suffix" with payload "complex match" from pattern_notifier
+pattern_listener: NOTIFY "prefix_a_b_suffix" with payload "multi char middle" from pattern_notifier
+
+starting permutation: plisten_escaped pnotify_literal_star pnotify_literal_other pcheck
+step plisten_escaped: LISTEN 'literal\*star';
+step pnotify_literal_star: NOTIFY "literal*star", 'escaped star match';
+step pnotify_literal_other: NOTIFY literal_other_star, 'should not match escaped';
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "literal*star" with payload "escaped star match" from pattern_notifier
+
+starting permutation: plisten_multi pnotify_event_created pnotify_alert_x pnotify_nomatch pcheck
+step plisten_multi: LISTEN 'event_*'; LISTEN 'alert_?';
+step pnotify_event_created: NOTIFY event_created, 'event';
+step pnotify_alert_x: NOTIFY alert_x, 'alert';
+step pnotify_nomatch: NOTIFY completely_different, 'no match';
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "event_created" with payload "event" from pattern_notifier
+pattern_listener: NOTIFY "alert_x" with payload "alert" from pattern_notifier
+
+starting permutation: plisten_star pnotify_user_login pcheck
+step plisten_star: LISTEN 'user_*';
+step pnotify_user_login: NOTIFY user_login, 'login payload';
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "user_login" with payload "login payload" from pattern_notifier
+
+starting permutation: llisten plisten_star notify1 pnotify_user_login lcheck pcheck
+step llisten: LISTEN c1; LISTEN c2;
+step plisten_star: LISTEN 'user_*';
+step notify1: NOTIFY c1;
+step pnotify_user_login: NOTIFY user_login, 'login payload';
+step lcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+listener: NOTIFY "c1" with payload "" from notifier
+step pcheck: SELECT 1 AS x;
+x
+-
+1
+(1 row)
+
+pattern_listener: NOTIFY "user_login" with payload "login payload" from pattern_notifier

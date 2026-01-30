@@ -290,6 +290,7 @@ typedef struct QueueBackendStatus
 	QueuePosition pos;			/* backend has read queue up to here */
 	bool		wakeupPending;	/* signal sent to backend, not yet processed */
 	bool		isAdvancing;	/* backend is advancing its position */
+	bool		hasPatterns;	/* backend is listening on pattern channels */
 } QueueBackendStatus;
 
 /*
@@ -354,6 +355,7 @@ static AsyncQueueControl *asyncQueueControl;
 #define QUEUE_BACKEND_POS(i)		(asyncQueueControl->backend[i].pos)
 #define QUEUE_BACKEND_WAKEUP_PENDING(i)	(asyncQueueControl->backend[i].wakeupPending)
 #define QUEUE_BACKEND_IS_ADVANCING(i)	(asyncQueueControl->backend[i].isAdvancing)
+#define QUEUE_BACKEND_HAS_PATTERNS(i)	(asyncQueueControl->backend[i].hasPatterns)
 
 /*
  * The SLRU buffer area through which we access the notification queue
@@ -543,6 +545,13 @@ static bool unlistenExitRegistered = false;
 static bool amRegisteredListener = false;
 
 /*
+ * List of pattern channel names (those containing wildcards * or ?).
+ * These are stored separately because they cannot be matched via hash lookup.
+ * The list contains palloc'd strings in TopMemoryContext.
+ */
+static List *localPatternList = NIL;
+
+/*
  * Queue head positions for direct advancement.
  * These are captured during PreCommit_Notify while holding the heavyweight
  * lock on database 0, ensuring no other backend can insert notifications
@@ -588,6 +597,8 @@ static void RemoveListenerFromChannel(GlobalChannelEntry **entry_ptr,
 									  int idx);
 static void ApplyPendingListenActions(bool isCommit);
 static void CleanupListenersOnExit(void);
+static bool IsPattern(const char *channel);
+static bool MatchPattern(const char *channel, const char *pattern);
 static bool IsListeningOn(const char *channel);
 static void asyncQueueUnregister(void);
 static bool asyncQueueIsFull(void);
@@ -821,6 +832,7 @@ AsyncShmemInit(void)
 			SET_QUEUE_POS(QUEUE_BACKEND_POS(i), 0, 0);
 			QUEUE_BACKEND_WAKEUP_PENDING(i) = false;
 			QUEUE_BACKEND_IS_ADVANCING(i) = false;
+			QUEUE_BACKEND_HAS_PATTERNS(i) = false;
 		}
 	}
 
@@ -1517,6 +1529,10 @@ BecomeRegisteredListener(void)
  * globalChannelTable with listening=false.  The listening flag will be set
  * to true in AtCommit_Notify.  If we abort later, unwanted table entries
  * will be removed.
+ *
+ * For pattern channels (those containing * or ?), we add them to the local
+ * pattern list instead of the global channel table, since they cannot be
+ * looked up by exact name.
  */
 static void
 PrepareTableEntriesForListen(const char *channel)
@@ -1547,6 +1563,38 @@ PrepareTableEntriesForListen(const char *channel)
 	 * PrepareTableEntriesForUnlisten and PrepareTableEntriesForUnlistenAll.
 	 */
 	(void) hash_search(localChannelTable, channel, HASH_ENTER, NULL);
+
+	/*
+	 * For pattern channels, add to the local pattern list and set the
+	 * hasPatterns flag so we get signaled for all notifications. We don't add
+	 * patterns to globalChannelTable since they can't be matched by exact
+	 * channel name lookup.
+	 */
+	if (IsPattern(channel))
+	{
+		MemoryContext oldcxt;
+		char	   *pattern_copy;
+
+		/* Check if we already have this pattern */
+		foreach_ptr(char, existing, localPatternList)
+		{
+			if (strcmp(existing, channel) == 0)
+				return;			/* already have it */
+		}
+
+		/* Add pattern to the list in TopMemoryContext so it persists */
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		pattern_copy = pstrdup(channel);
+		localPatternList = lappend(localPatternList, pattern_copy);
+		MemoryContextSwitchTo(oldcxt);
+
+		/* Set the flag so we get woken up for any notification */
+		LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
+		QUEUE_BACKEND_HAS_PATTERNS(MyProcNumber) = true;
+		LWLockRelease(NotifyQueueLock);
+
+		return;
+	}
 
 	/* Pre-allocate entry in shared globalChannelTable with listening=false */
 	GlobalChannelKeyInit(&key, MyDatabaseId, channel);
@@ -1732,6 +1780,73 @@ ApplyPendingListenActions(bool isCommit)
 		bool		foundListener = false;
 
 		/*
+		 * Handle pattern channels specially - they're not in
+		 * globalChannelTable.
+		 */
+		if (IsPattern(pending->channel))
+		{
+			if (isCommit)
+			{
+				if (pending->action == PENDING_LISTEN)
+				{
+					/* Pattern LISTEN committed - keep in localPatternList */
+					removeLocal = false;
+				}
+				else
+				{
+					/*
+					 * Pattern UNLISTEN committed - remove from
+					 * localPatternList
+					 */
+					ListCell   *lc;
+
+					foreach(lc, localPatternList)
+					{
+						char	   *pattern = (char *) lfirst(lc);
+
+						if (strcmp(pattern, pending->channel) == 0)
+						{
+							localPatternList = foreach_delete_current(localPatternList, lc);
+							pfree(pattern);
+							break;
+						}
+					}
+				}
+			}
+			else
+			{
+				/* Aborting - remove pattern that was added during PreCommit */
+				ListCell   *lc;
+
+				foreach(lc, localPatternList)
+				{
+					char	   *pattern = (char *) lfirst(lc);
+
+					if (strcmp(pattern, pending->channel) == 0)
+					{
+						localPatternList = foreach_delete_current(localPatternList, lc);
+						pfree(pattern);
+						break;
+					}
+				}
+			}
+
+			/* Update hasPatterns flag if we have no more patterns */
+			if (localPatternList == NIL)
+			{
+				LWLockAcquire(NotifyQueueLock, LW_EXCLUSIVE);
+				QUEUE_BACKEND_HAS_PATTERNS(MyProcNumber) = false;
+				LWLockRelease(NotifyQueueLock);
+			}
+
+			/* Remove from localChannelTable if needed */
+			if (removeLocal && localChannelTable != NULL)
+				(void) hash_search(localChannelTable, pending->channel,
+								   HASH_REMOVE, NULL);
+			continue;
+		}
+
+		/*
 		 * Find the global entry for this channel.  If isCommit, it had better
 		 * exist (it was created in PreCommit).  In an abort, it might not
 		 * exist, in which case we are not listening and should discard any
@@ -1849,6 +1964,13 @@ CleanupListenersOnExit(void)
 		localChannelTable = NULL;
 	}
 
+	/* Clear the pattern list */
+	if (localPatternList != NIL)
+	{
+		list_free_deep(localPatternList);
+		localPatternList = NIL;
+	}
+
 	/* Now remove our entries from the shared globalChannelTable */
 	if (globalChannelTable == NULL)
 		return;
@@ -1886,6 +2008,112 @@ CleanupListenersOnExit(void)
 }
 
 /*
+ * Check if a channel name contains pattern wildcards (* or ?).
+ */
+static bool
+IsPattern(const char *channel)
+{
+	return (strchr(channel, '*') != NULL || strchr(channel, '?') != NULL);
+}
+
+/*
+ * Match a channel name against a glob-style pattern.
+ * Supports:
+ *   * - matches zero or more characters
+ *   ? - matches exactly one character
+ *   \ - escapes the next character (to match literal * or ?)
+ *
+ * Returns true if the channel matches the pattern.
+ */
+static bool
+MatchPattern(const char *channel, const char *pattern)
+{
+	const char *c = channel;
+	const char *p = pattern;
+
+	/* position in channel and pattern after last * match */
+	const char *c_star = NULL;
+	const char *p_star = NULL;
+
+	/* Iterate over each character on channel and on pattern */
+	while (*c != '\0')
+	{
+		if (*c == *p)
+		{
+			/* Literal match */
+			c++;
+			p++;
+		}
+		else if (*p == '\\' && *(p + 1) != '\0')
+		{
+			/* Escaped character - must match literally */
+			p++;
+			if (*c == *p)
+			{
+				c++;
+				p++;
+			}
+			else if (p_star != NULL)
+			{
+				/* Backtrack to last * */
+				p = p_star;
+				c = ++c_star;
+			}
+			else
+				return false;
+		}
+		else if (*p == '?')
+		{
+			/* ? matches any single character, so go to the next */
+			c++;
+			p++;
+		}
+		else if (*p == '*')
+		{
+			/* Remember position for backtracking */
+			p_star = p++;
+			c_star = c;
+		}
+		else if (p_star != NULL)
+		{
+			/* Mismatch, but we have a * to backtrack to */
+			p = p_star;
+			c = ++c_star;
+		}
+		else
+		{
+			/* Mismatch with no * to backtrack to */
+			return false;
+		}
+	}
+
+	/* Skip trailing *'s in pattern */
+	while (*p == '*')
+		p++;
+
+	return (*p == '\0');
+}
+
+/*
+ * Check if the channel matches any pattern we are listening on.
+ */
+static bool
+IsListeningOnPattern(const char *channel)
+{
+	ListCell   *lc;
+
+	foreach(lc, localPatternList)
+	{
+		const char *pattern = (const char *) lfirst(lc);
+
+		if (MatchPattern(channel, pattern))
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * Test whether we are actively listening on the given channel name.
  *
  * Note: this function is executed for every notification found in the queue.
@@ -1896,7 +2124,10 @@ IsListeningOn(const char *channel)
 	if (localChannelTable == NULL)
 		return false;
 
-	return (hash_search(localChannelTable, channel, HASH_FIND, NULL) != NULL);
+	if (hash_search(localChannelTable, channel, HASH_FIND, NULL) != NULL)
+		return true;
+
+	return IsListeningOnPattern(channel);
 }
 
 /*
@@ -1920,6 +2151,7 @@ asyncQueueUnregister(void)
 	QUEUE_BACKEND_DBOID(MyProcNumber) = InvalidOid;
 	QUEUE_BACKEND_WAKEUP_PENDING(MyProcNumber) = false;
 	QUEUE_BACKEND_IS_ADVANCING(MyProcNumber) = false;
+	QUEUE_BACKEND_HAS_PATTERNS(MyProcNumber) = false;
 	/* and remove it from the list */
 	if (QUEUE_FIRST_LISTENER == MyProcNumber)
 		QUEUE_FIRST_LISTENER = QUEUE_NEXT_LISTENER(MyProcNumber);
@@ -2327,6 +2559,10 @@ SignalBackends(void)
 	 * flags above).  Check to see if we can directly advance their queue
 	 * pointers to save a wakeup.  Otherwise, if they are far behind, wake
 	 * them anyway so they will catch up.
+	 *
+	 * Also signal backends that are listening on pattern channels, since they
+	 * may match our notifications but weren't found in the per-channel lookup
+	 * above.
 	 */
 	for (ProcNumber i = QUEUE_FIRST_LISTENER; i != INVALID_PROC_NUMBER; i = QUEUE_NEXT_LISTENER(i))
 	{
@@ -2342,6 +2578,24 @@ SignalBackends(void)
 
 		pid = QUEUE_BACKEND_PID(i);
 		pos = QUEUE_BACKEND_POS(i);
+
+		/*
+		 * If this backend has pattern listeners and is in the same database,
+		 * we need to wake it up so it can check if any notifications match
+		 * its patterns.
+		 */
+		if (QUEUE_BACKEND_HAS_PATTERNS(i) &&
+			QUEUE_BACKEND_DBOID(i) == MyDatabaseId &&
+			!QUEUE_POS_EQUAL(pos, QUEUE_HEAD))
+		{
+			Assert(pid != InvalidPid);
+
+			QUEUE_BACKEND_WAKEUP_PENDING(i) = true;
+			signalPids[count] = pid;
+			signalProcnos[count] = i;
+			count++;
+			continue;
+		}
 
 		/*
 		 * We can directly advance the other backend's queue pointer if it's

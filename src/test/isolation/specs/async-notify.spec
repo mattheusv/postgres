@@ -154,3 +154,64 @@ permutation lch_listen nch_notify lch_check
 # Hence, this should be the last test in this script.
 
 permutation llisten lbegin usage bignotify usage
+
+#
+# Pattern LISTEN/NOTIFY tests
+#
+
+# Session for pattern listening tests
+session pattern_listener
+step plisten_star	{ LISTEN 'user_*'; }
+step plisten_question	{ LISTEN 'msg_?'; }
+step plisten_complex	{ LISTEN 'prefix_*_suffix'; }
+step plisten_escaped	{ LISTEN 'literal\*star'; }
+step plisten_multi	{ LISTEN 'event_*'; LISTEN 'alert_?'; }
+step pcheck		{ SELECT 1 AS x; }
+teardown		{ UNLISTEN *; }
+
+# Session for sending notifications to pattern listeners
+session pattern_notifier
+step pnotify_user_login		{ NOTIFY user_login, 'login payload'; }
+step pnotify_user_logout	{ NOTIFY user_logout, 'logout payload'; }
+step pnotify_user_empty		{ NOTIFY user_, 'empty suffix'; }
+step pnotify_msg_1		{ NOTIFY msg_1, 'message 1'; }
+step pnotify_msg_a		{ NOTIFY msg_a, 'message a'; }
+step pnotify_msg_12		{ NOTIFY msg_12, 'too long - should not match ?'; }
+step pnotify_prefix_mid_suffix	{ NOTIFY prefix_mid_suffix, 'complex match'; }
+step pnotify_prefix_suffix	{ NOTIFY prefix_suffix, 'no middle - should not match'; }
+step pnotify_prefix_a_b_suffix	{ NOTIFY prefix_a_b_suffix, 'multi char middle'; }
+step pnotify_literal_star	{ NOTIFY "literal*star", 'escaped star match'; }
+step pnotify_literal_other	{ NOTIFY literal_other_star, 'should not match escaped'; }
+step pnotify_event_created	{ NOTIFY event_created, 'event'; }
+step pnotify_alert_x		{ NOTIFY alert_x, 'alert'; }
+step pnotify_nomatch		{ NOTIFY completely_different, 'no match'; }
+
+# Basic pattern with * (zero or more characters)
+# Should receive: user_login, user_logout, user_ (empty suffix matches *)
+permutation plisten_star pnotify_user_login pnotify_user_logout pnotify_user_empty pcheck
+
+# Pattern with ? (exactly one character)
+# Should receive: msg_1, msg_a
+# Should NOT receive: msg_12 (two chars after _)
+permutation plisten_question pnotify_msg_1 pnotify_msg_a pnotify_msg_12 pcheck
+
+# Complex pattern with * in the middle
+# Should receive: prefix_mid_suffix, prefix_a_b_suffix
+# Should NOT receive: prefix_suffix (requires at least one char for *)
+permutation plisten_complex pnotify_prefix_mid_suffix pnotify_prefix_suffix pnotify_prefix_a_b_suffix pcheck
+
+# Escaped wildcard (literal * matching)
+# Should receive: literal*star
+# Should NOT receive: literal_other_star
+permutation plisten_escaped pnotify_literal_star pnotify_literal_other pcheck
+
+# Multiple patterns on same session
+# Should receive: event_created (matches event_*), alert_x (matches alert_?)
+# Should NOT receive: completely_different
+permutation plisten_multi pnotify_event_created pnotify_alert_x pnotify_nomatch pcheck
+
+# Cross-session pattern test: listener listens before notifier sends
+permutation plisten_star pnotify_user_login pcheck
+
+# Pattern listener with regular listener (mixed)
+permutation llisten plisten_star notify1 pnotify_user_login lcheck pcheck

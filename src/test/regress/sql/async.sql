@@ -21,3 +21,31 @@ UNLISTEN *;
 -- Should return zero while there are no pending notifications.
 -- src/test/isolation/specs/async-notify.spec tests for actual usage.
 SELECT pg_notification_queue_usage();
+
+--
+-- Pattern LISTEN tests
+-- (actual notification delivery is tested in src/test/isolation/specs/async-notify.spec)
+--
+
+-- Pattern with * (matches zero or more characters)
+LISTEN "user_*";
+UNLISTEN "user_*";
+
+-- Pattern with ? (matches exactly one character)
+LISTEN "msg_?";
+UNLISTEN "msg_?";
+
+-- Pattern with wildcards in the middle
+LISTEN "prefix_*_suffix";
+UNLISTEN "prefix_*_suffix";
+
+-- Escaped wildcards (for literal * and ? matching)
+LISTEN "literal\*star";
+LISTEN "literal\?question";
+UNLISTEN "literal\*star";
+UNLISTEN "literal\?question";
+
+-- Multiple patterns
+LISTEN "event_*";
+LISTEN "alert_?";
+UNLISTEN *;

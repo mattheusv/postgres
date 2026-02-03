@@ -1301,7 +1301,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 										   false);
 			idxstmt =
 				generateClonedIndexStmt(NULL, idxRel,
-										attmap, &constraintOid);
+										attmap, &constraintOid, false);
 			DefineIndex(NULL,
 						RelationGetRelid(rel),
 						idxstmt,
@@ -20771,7 +20771,7 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 
 			stmt = generateClonedIndexStmt(NULL,
 										   idxRel, attmap,
-										   &conOid);
+										   &conOid, false);
 			DefineIndex(NULL,
 						RelationGetRelid(attachrel), stmt, InvalidOid,
 						RelationGetRelid(idxRel),

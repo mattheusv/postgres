@@ -66,5 +66,78 @@ CREATE SCHEMA regress_schema_1 AUTHORIZATION CURRENT_ROLE
 DROP SCHEMA regress_schema_1 CASCADE;
 RESET ROLE;
 
+--
+-- CREATE SCHEMA ... LIKE tests
+--
+
+-- Create a source schema with various objects
+CREATE SCHEMA regress_source_schema;
+
+CREATE TABLE regress_source_schema.t1 (
+    id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name text NOT NULL,
+    created_at timestamp DEFAULT now()
+);
+
+CREATE TABLE regress_source_schema.t2 (
+    id int REFERENCES regress_source_schema.t1(id),
+    data jsonb
+);
+
+CREATE INDEX idx_t1_name ON regress_source_schema.t1(name);
+CREATE INDEX idx_t2_data ON regress_source_schema.t2 USING gin(data);
+
+CREATE UNLOGGED TABLE regress_source_schema.t3(a int);
+
+-- Test basic LIKE with TABLE
+CREATE SCHEMA regress_copy1 LIKE regress_source_schema INCLUDING TABLE;
+
+-- Verify tables were copied
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'regress_copy1' ORDER BY table_name;
+
+-- Verify table structure (should have columns but not indexes)
+\d regress_copy1.t1
+
+-- Verify that relpersistence is the same
+SELECT relpersistence, relname from pg_class where relname = 't3' and relnamespace = 'regress_copy1'::regnamespace::oid;;
+
+-- Test LIKE with TABLE and INDEX
+CREATE SCHEMA regress_copy2 LIKE regress_source_schema INCLUDING TABLE INCLUDING INDEX;
+
+-- Verify indexes were copied (the name should be the same)
+SELECT indexname FROM pg_indexes WHERE schemaname = 'regress_copy2' ORDER BY indexname;
+
+-- Verify table structure (should have columns and indexes)
+\d regress_copy2.t1
+
+-- Test EXCLUDING option
+CREATE SCHEMA regress_copy3 LIKE regress_source_schema INCLUDING ALL EXCLUDING INDEX;
+
+-- Should have tables but no indexes
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'regress_copy3' ORDER BY table_name;
+SELECT indexname FROM pg_indexes WHERE schemaname = 'regress_copy3' ORDER BY indexname;
+
+-- Test IF NOT EXISTS with LIKE
+CREATE SCHEMA IF NOT EXISTS regress_copy1 LIKE regress_source_schema INCLUDING TABLE;
+
+-- Test empty source schema
+CREATE SCHEMA regress_empty_source;
+CREATE SCHEMA regress_copy4 LIKE regress_empty_source INCLUDING ALL;
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'regress_copy4' ORDER BY table_name;
+
+-- Test source schema does not exist
+CREATE SCHEMA regress_copy_fail LIKE nonexistent_schema INCLUDING TABLE;
+
+-- Clean up LIKE tests
+DROP SCHEMA regress_copy1 CASCADE;
+DROP SCHEMA regress_copy2 CASCADE;
+DROP SCHEMA regress_copy3 CASCADE;
+DROP SCHEMA regress_copy4 CASCADE;
+DROP SCHEMA regress_empty_source CASCADE;
+DROP SCHEMA regress_source_schema CASCADE;
+
 -- Clean up
 DROP ROLE regress_create_schema_role;

@@ -2719,6 +2719,7 @@ ScanKeywordList
 ScanState
 ScanTypeControl
 ScannerCallbackState
+SchemaLikeClause
 SchemaQuery
 SearchPathCacheEntry
 SearchPathCacheKey

@@ -600,6 +600,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <node>	DomainConstraint TableConstraint TableLikeClause
 %type <ival>	TableLikeOptionList TableLikeOption
+%type <ival>	SchemaLikeOptionList SchemaLikeOption
 %type <str>		column_compression opt_column_compression column_storage opt_column_storage
 %type <list>	ColQualList
 %type <node>	ColConstraint ColConstraintElem ConstraintAttr
@@ -1570,6 +1571,7 @@ CreateSchemaStmt:
 					n->authrole = $5;
 					n->schemaElts = $6;
 					n->if_not_exists = false;
+					n->like_clause = NULL;
 					$$ = (Node *) n;
 				}
 			| CREATE SCHEMA ColId OptSchemaEltList
@@ -1581,6 +1583,7 @@ CreateSchemaStmt:
 					n->authrole = NULL;
 					n->schemaElts = $4;
 					n->if_not_exists = false;
+					n->like_clause = NULL;
 					$$ = (Node *) n;
 				}
 			| CREATE SCHEMA IF_P NOT EXISTS opt_single_name AUTHORIZATION RoleSpec OptSchemaEltList
@@ -1597,6 +1600,7 @@ CreateSchemaStmt:
 								 parser_errposition(@9)));
 					n->schemaElts = $9;
 					n->if_not_exists = true;
+					n->like_clause = NULL;
 					$$ = (Node *) n;
 				}
 			| CREATE SCHEMA IF_P NOT EXISTS ColId OptSchemaEltList
@@ -1613,6 +1617,40 @@ CreateSchemaStmt:
 								 parser_errposition(@7)));
 					n->schemaElts = $7;
 					n->if_not_exists = true;
+					n->like_clause = NULL;
+					$$ = (Node *) n;
+				}
+			/* CREATE SCHEMA ... LIKE variants */
+			| CREATE SCHEMA ColId LIKE ColId SchemaLikeOptionList
+				{
+					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
+					SchemaLikeClause *l = makeNode(SchemaLikeClause);
+
+					n->schemaname = $3;
+					n->authrole = NULL;
+					n->schemaElts = NIL;
+					n->if_not_exists = false;
+
+					l->schemaname = $5;
+					l->options = $6;
+					n->like_clause = l;
+
+					$$ = (Node *) n;
+				}
+			| CREATE SCHEMA IF_P NOT EXISTS ColId LIKE ColId SchemaLikeOptionList
+				{
+					CreateSchemaStmt *n = makeNode(CreateSchemaStmt);
+					SchemaLikeClause *l = makeNode(SchemaLikeClause);
+
+					n->schemaname = $6;
+					n->authrole = NULL;
+					n->schemaElts = NIL;
+					n->if_not_exists = true;
+
+					l->schemaname = $8;
+					l->options = $9;
+					n->like_clause = l;
+
 					$$ = (Node *) n;
 				}
 		;
@@ -1637,6 +1675,21 @@ schema_stmt:
 			| CreateTrigStmt
 			| GrantStmt
 			| ViewStmt
+		;
+
+/*
+ * Options for CREATE SCHEMA ... LIKE
+ */
+SchemaLikeOptionList:
+			SchemaLikeOptionList INCLUDING SchemaLikeOption		{ $$ = $1 | $3; }
+			| SchemaLikeOptionList EXCLUDING SchemaLikeOption	{ $$ = $1 & ~$3; }
+			| /* EMPTY */										{ $$ = 0; }
+		;
+
+SchemaLikeOption:
+			TABLE			{ $$ = CREATE_SCHEMA_LIKE_TABLE; }
+			| INDEX			{ $$ = CREATE_SCHEMA_LIKE_INDEX; }
+			| ALL			{ $$ = CREATE_SCHEMA_LIKE_ALL; }
 		;
 
 

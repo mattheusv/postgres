@@ -1515,7 +1515,8 @@ DefineIndex(ParseState *pstate,
 					childStmt = generateClonedIndexStmt(NULL,
 														parentIndex,
 														attmap,
-														NULL);
+														NULL,
+														false);
 
 					/*
 					 * Recurse as the starting user ID.  Callee will use that

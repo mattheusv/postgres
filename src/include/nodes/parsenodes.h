@@ -782,6 +782,8 @@ typedef struct TableLikeClause
 	RangeVar   *relation;
 	bits32		options;		/* OR of TableLikeOption flags */
 	Oid			relationOid;	/* If table has been looked up, its OID */
+	bool		preserveIndexNames; /* true if index name should be preserved
+									 * for the new table */
 } TableLikeClause;
 
 typedef enum TableLikeOption
@@ -2411,6 +2413,20 @@ typedef enum ObjectType
  * executed after the schema itself is created.
  * ----------------------
  */
+typedef struct SchemaLikeClause
+{
+	NodeTag		type;
+	char	   *schemaname;		/* source schema name */
+	bits32		options;		/* OR of SchemaLikeOption flags */
+} SchemaLikeClause;
+
+typedef enum SchemaLikeOption
+{
+	CREATE_SCHEMA_LIKE_TABLE = 1 << 0,
+	CREATE_SCHEMA_LIKE_INDEX = 1 << 1,
+	CREATE_SCHEMA_LIKE_ALL = PG_INT32_MAX
+} SchemaLikeOption;
+
 typedef struct CreateSchemaStmt
 {
 	NodeTag		type;
@@ -2418,6 +2434,7 @@ typedef struct CreateSchemaStmt
 	RoleSpec   *authrole;		/* the owner of the created schema */
 	List	   *schemaElts;		/* schema components (list of parsenodes) */
 	bool		if_not_exists;	/* just do nothing if schema already exists? */
+	SchemaLikeClause *like_clause;	/* LIKE clause if present, else NULL */
 } CreateSchemaStmt;
 
 typedef enum DropBehavior

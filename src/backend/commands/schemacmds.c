@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -28,16 +29,139 @@
 #include "commands/event_trigger.h"
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "parser/parse_utilcmd.h"
 #include "parser/scansup.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
 static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
+static List *collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
+									 bits32 options);
+
+/*
+ * Subroutine for CREATE SCHEMA LIKE.
+ *
+ * It return a list of CreateStmt statements for tables that are on source
+ * schema that should be created on target schema.
+ *
+ * It uses CREATE TABLE ... LIKE existing infrastructure.
+ */
+static List *
+collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
+						bits32 options)
+{
+	List	   *result = NIL;
+	bool		preserveIndexNames = false;
+	Relation	pg_class;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tuple;
+	bits32		tableOptions;
+
+	/*
+	 * Determine CREATE TABLE LIKE options. We copy most properties by
+	 * default, but indexes are controlled by the CREATE_SCHEMA_LIKE_INDEX
+	 * option.
+	 */
+	tableOptions = CREATE_TABLE_LIKE_COMMENTS |
+		CREATE_TABLE_LIKE_COMPRESSION |
+		CREATE_TABLE_LIKE_CONSTRAINTS |
+		CREATE_TABLE_LIKE_DEFAULTS |
+		CREATE_TABLE_LIKE_GENERATED |
+		CREATE_TABLE_LIKE_IDENTITY |
+		CREATE_TABLE_LIKE_STATISTICS |
+		CREATE_TABLE_LIKE_STORAGE;
+
+	/*
+	 * If indexes are enabled to be created we want to preserve the index
+	 * names for the new schema.
+	 */
+	if (options & CREATE_SCHEMA_LIKE_INDEX)
+	{
+		tableOptions |= CREATE_TABLE_LIKE_INDEXES;
+		preserveIndexNames = true;
+	}
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+
+	/*
+	 * Scan pg_class filtering relations of source schema that need to be
+	 * created in the target schema.
+	 */
+	ScanKeyInit(&key,
+				Anum_pg_class_relnamespace,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(srcNspOid));
+
+	scan = systable_beginscan(pg_class, ClassNameNspIndexId, true,
+							  NULL, 1, &key);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+		CreateStmt *createStmt;
+		TableLikeClause *likeClause;
+		RangeVar   *newRelation;
+		RangeVar   *sourceRelation;
+
+		/* Only process regular and partitioned tables */
+		if (classForm->relkind != RELKIND_RELATION &&
+			classForm->relkind != RELKIND_PARTITIONED_TABLE)
+			continue;
+
+		createStmt = makeNode(CreateStmt);
+		likeClause = makeNode(TableLikeClause);
+
+		/* Target table in new schema */
+		newRelation = makeRangeVar(pstrdup(newSchemaName),
+								   pstrdup(NameStr(classForm->relname)),
+								   -1);
+		newRelation->relpersistence = classForm->relpersistence;
+
+		/* Source table reference */
+		sourceRelation = makeRangeVar(get_namespace_name(srcNspOid),
+									  pstrdup(NameStr(classForm->relname)),
+									  -1);
+
+		likeClause->relation = sourceRelation;
+		likeClause->options = tableOptions;
+		likeClause->relationOid = InvalidOid;
+		likeClause->preserveIndexNames = preserveIndexNames;
+
+		createStmt->relation = newRelation;
+		createStmt->tableElts = list_make1(likeClause);
+		createStmt->inhRelations = NIL;
+		createStmt->partbound = NULL;
+		createStmt->partspec = NULL;
+		createStmt->ofTypename = NULL;
+		createStmt->constraints = NIL;
+		createStmt->nnconstraints = NIL;
+		createStmt->options = NIL;
+		createStmt->oncommit = ONCOMMIT_NOOP;
+
+		/*
+		 * XXX: Should we have INCLUDING TABLESPACE? If not, should we use the
+		 * same tablespace of source table?
+		 */
+		createStmt->tablespacename = NULL;
+		createStmt->accessMethod = NULL;
+		createStmt->if_not_exists = false;
+
+
+		result = lappend(result, createStmt);
+	}
+
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+
+	return result;
+}
 
 /*
  * CREATE SCHEMA
@@ -186,6 +310,39 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	ObjectAddressSet(address, NamespaceRelationId, namespaceId);
 	EventTriggerCollectSimpleCommand(address, InvalidObjectAddress,
 									 (Node *) stmt);
+
+	/*
+	 * Process LIKE clause if present.  We collect objects from the source
+	 * schema and append them to the schema elements list.
+	 */
+	if (stmt->like_clause != NULL)
+	{
+		SchemaLikeClause *like = stmt->like_clause;
+		List	   *like_stmts = NIL;
+		Oid			srcNspOid;
+		AclResult	like_aclresult;
+
+		/* Look up source schema */
+		srcNspOid = get_namespace_oid(like->schemaname, false);
+
+		/* Check permission to read from source schema */
+		like_aclresult = object_aclcheck(NamespaceRelationId, srcNspOid,
+										 GetUserId(), ACL_USAGE);
+		if (like_aclresult != ACLCHECK_OK)
+			aclcheck_error(like_aclresult, OBJECT_SCHEMA, like->schemaname);
+
+		/* Collect tables if requested */
+		if ((like->options & CREATE_SCHEMA_LIKE_TABLE) ||
+			(like->options == CREATE_SCHEMA_LIKE_ALL))
+		{
+			like_stmts = collectSchemaTablesLike(srcNspOid,
+												 schemaName,
+												 like->options);
+		}
+
+		/* Append LIKE-generated statements to explicit schema elements */
+		stmt->schemaElts = list_concat(like_stmts, stmt->schemaElts);
+	}
 
 	/*
 	 * Examine the list of commands embedded in the CREATE SCHEMA command, and

@@ -1567,7 +1567,8 @@ expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 			index_stmt = generateClonedIndexStmt(heapRel,
 												 parent_index,
 												 attmap,
-												 NULL);
+												 NULL,
+												 table_like_clause->preserveIndexNames);
 
 			/* Copy comment on index, if requested */
 			if (table_like_clause->options & CREATE_TABLE_LIKE_COMMENTS)
@@ -1694,7 +1695,8 @@ transformOfType(CreateStmtContext *cxt, TypeName *ofTypename)
 IndexStmt *
 generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
 						const AttrMap *attmap,
-						Oid *constraintOid)
+						Oid *constraintOid,
+						bool preserveIndexName)
 {
 	Oid			source_relid = RelationGetRelid(source_idx);
 	HeapTuple	ht_idxrel;
@@ -1771,12 +1773,19 @@ generateClonedIndexStmt(RangeVar *heapRel, Relation source_idx,
 	index->reset_default_tblspc = false;
 
 	/*
-	 * We don't try to preserve the name of the source index; instead, just
+	 * By default, we don't preserve the name of the source index; instead,
 	 * let DefineIndex() choose a reasonable name.  (If we tried to preserve
 	 * the name, we'd get duplicate-relation-name failures unless the source
 	 * table was in a different schema.)
+	 *
+	 * However, when preserveIndexName is true (e.g., when copying tables
+	 * between schemas via CREATE SCHEMA ... LIKE), we preserve the original
+	 * name since it won't conflict in the different namespace.
 	 */
-	index->idxname = NULL;
+	if (preserveIndexName)
+		index->idxname = pstrdup(NameStr(idxrelrec->relname));
+	else
+		index->idxname = NULL;
 
 	/*
 	 * If the index is marked PRIMARY or has an exclusion condition, it's

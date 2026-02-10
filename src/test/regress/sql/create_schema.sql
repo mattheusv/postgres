@@ -131,11 +131,114 @@ WHERE table_schema = 'regress_copy4' ORDER BY table_name;
 -- Test source schema does not exist
 CREATE SCHEMA regress_copy_fail LIKE nonexistent_schema INCLUDING TABLE;
 
+--
+-- Test partitioned tables handling
+--
+
+-- Create a schema with partitioned table and partitions
+CREATE SCHEMA regress_part_source;
+
+CREATE TABLE regress_part_source.sales (
+    id int,
+    sale_date date,
+    amount numeric
+) PARTITION BY RANGE (sale_date);
+
+CREATE TABLE regress_part_source.sales2 (
+    id SERIAL,
+    amount NUMERIC,
+    sale_date DATE
+) PARTITION BY RANGE (EXTRACT(YEAR FROM sale_date));
+
+CREATE TABLE regress_part_source.sales_2025 PARTITION OF regress_part_source.sales2 FOR VALUES FROM (2024) TO (2025);
+CREATE TABLE regress_part_source.sales_2026 PARTITION OF regress_part_source.sales2 FOR VALUES FROM (2025) TO (2026);
+
+CREATE TABLE regress_part_source.sales_2023 PARTITION OF regress_part_source.sales
+    FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+
+CREATE TABLE regress_part_source.sales_2024 PARTITION OF regress_part_source.sales
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+-- Copy the schema - partitioned table should preserve partition spec
+-- and partitions should be attached
+CREATE SCHEMA regress_part_copy LIKE regress_part_source INCLUDING ALL;
+
+-- Verify the partitioned table was created with partition spec and that
+-- partitions were attached
+\d+ regress_part_copy.sales
+\d+ regress_part_copy.sales2
+
+-- Test orphan partitions: parent in different schema
+-- Create partition in different schema than its parent
+CREATE SCHEMA regress_orphan_source;
+CREATE TABLE regress_orphan_source.orphan_part PARTITION OF regress_part_source.sales
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- Copy the schema with orphan partition - should skip with WARNING
+CREATE SCHEMA regress_orphan_copy LIKE regress_orphan_source INCLUDING ALL;
+
+-- The orphan partition should NOT be copied (it was skipped)
+\d regress_orphan_copy.*
+
+-- Test list partitioning
+CREATE SCHEMA regress_list_part_source;
+
+CREATE TABLE regress_list_part_source.products (
+    id int,
+    category text,
+    name text
+) PARTITION BY LIST (category);
+
+CREATE TABLE regress_list_part_source.products_electronics
+    PARTITION OF regress_list_part_source.products
+    FOR VALUES IN ('electronics', 'computers');
+
+CREATE TABLE regress_list_part_source.products_clothing
+    PARTITION OF regress_list_part_source.products
+    FOR VALUES IN ('clothing', 'shoes');
+
+CREATE SCHEMA regress_list_part_copy LIKE regress_list_part_source INCLUDING ALL;
+
+-- Verify list partitioned table structure and that partitions were attached correctly
+\d+ regress_list_part_copy.products
+
+-- Test hash partitioning
+CREATE SCHEMA regress_hash_part_source;
+
+CREATE TABLE regress_hash_part_source.events (
+    id int,
+    event_type text
+) PARTITION BY HASH (id);
+
+CREATE TABLE regress_hash_part_source.events_0
+    PARTITION OF regress_hash_part_source.events
+    FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+
+CREATE TABLE regress_hash_part_source.events_1
+    PARTITION OF regress_hash_part_source.events
+    FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+
+CREATE SCHEMA regress_hash_part_copy LIKE regress_hash_part_source INCLUDING ALL;
+
+-- Verify hash partitioned table structure and that partitions were attached correctly
+\d+ regress_hash_part_copy.events
+
+-- Clean up partition tests
+DROP SCHEMA regress_part_source CASCADE;
+DROP SCHEMA regress_part_copy CASCADE;
+DROP SCHEMA regress_orphan_source CASCADE;
+DROP SCHEMA regress_orphan_copy CASCADE;
+DROP SCHEMA regress_list_part_source CASCADE;
+DROP SCHEMA regress_list_part_copy CASCADE;
+DROP SCHEMA regress_hash_part_source CASCADE;
+DROP SCHEMA regress_hash_part_copy CASCADE;
+
 -- Clean up LIKE tests
 DROP SCHEMA regress_copy1 CASCADE;
 DROP SCHEMA regress_copy2 CASCADE;
 DROP SCHEMA regress_copy3 CASCADE;
 DROP SCHEMA regress_copy4 CASCADE;
+DROP SCHEMA regress_copy_func CASCADE;
 DROP SCHEMA regress_empty_source CASCADE;
 DROP SCHEMA regress_source_schema CASCADE;
 

@@ -19759,6 +19759,9 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec)
 	ParseNamespaceItem *nsitem;
 	ListCell   *l;
 
+	if (partspec->is_transformed)
+		return copyObject(partspec);
+
 	newspec = makeNode(PartitionSpec);
 
 	newspec->strategy = partspec->strategy;

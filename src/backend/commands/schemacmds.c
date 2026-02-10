@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/relation.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -22,6 +23,8 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
+#include "catalog/pg_partitioned_table.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
@@ -30,6 +33,7 @@
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/parse_utilcmd.h"
 #include "parser/scansup.h"
 #include "tcop/utility.h"
@@ -38,24 +42,200 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/syscache.h"
 
 static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
 static List *collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 									 bits32 options);
+static PartitionSpec *buildPartitionSpecForRelation(Oid relid);
+static PartitionBoundSpec *getPartitionBoundSpec(Oid partOid);
+
+/* Returns a PartitionBoundSpec node for the given partition OID. */
+static PartitionBoundSpec *
+getPartitionBoundSpec(Oid partOid)
+{
+	HeapTuple	tuple;
+	Datum		datum;
+	bool		isnull;
+	PartitionBoundSpec *boundspec;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(partOid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", partOid);
+
+	datum = SysCacheGetAttr(RELOID, tuple,
+							Anum_pg_class_relpartbound,
+							&isnull);
+	if (isnull)
+		elog(ERROR, "partition bound for relation %u is null", partOid);
+
+	boundspec = stringToNode(TextDatumGetCString(datum));
+
+	/*
+	 * stringToNode return a bound spec already transformed for LIST and RANGE
+	 * strategies. Hash bounds only have modulus/remainder as integers
+	 */
+	if (!boundspec->is_default && boundspec->strategy != PARTITION_STRATEGY_HASH)
+		boundspec->is_transformed = true;
+
+	ReleaseSysCache(tuple);
+
+	Assert(IsA(boundspec, PartitionBoundSpec));
+
+	return boundspec;
+}
+
+/*
+ * Constructs a PartitionSpec that can be used in a CreateStmt to recreate a
+ * partitioned table with the same partition key.
+ */
+static PartitionSpec *
+buildPartitionSpecForRelation(Oid relid)
+{
+	PartitionSpec *partspec;
+	HeapTuple	tuple;
+	Form_pg_partitioned_table form;
+	Datum		datum;
+	oidvector  *partcollation;
+	List	   *partexprs = NIL;
+	ListCell   *partexpr_item;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			keyno;
+
+	tuple = SearchSysCache1(PARTRELID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for partition key of %u", relid);
+
+	form = (Form_pg_partitioned_table) GETSTRUCT(tuple);
+
+	/* Get partcollation */
+	datum = SysCacheGetAttrNotNull(PARTRELID, tuple,
+								   Anum_pg_partitioned_table_partcollation);
+	partcollation = (oidvector *) DatumGetPointer(datum);
+
+	/* Get partition expressions if any */
+	if (!heap_attisnull(tuple, Anum_pg_partitioned_table_partexprs, NULL))
+	{
+		Datum		exprsDatum;
+		char	   *exprsString;
+
+		exprsDatum = SysCacheGetAttrNotNull(PARTRELID, tuple,
+											Anum_pg_partitioned_table_partexprs);
+		exprsString = TextDatumGetCString(exprsDatum);
+		partexprs = (List *) stringToNode(exprsString);
+
+		pfree(exprsString);
+
+		Assert(IsA(partexprs, List));
+	}
+
+	/* Open relation to get attribute names */
+	rel = relation_open(relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+
+	/* Build PartitionSpec */
+	partspec = makeNode(PartitionSpec);
+	partspec->strategy = form->partstrat;
+	partspec->partParams = NIL;
+	partspec->location = -1;
+
+	partexpr_item = list_head(partexprs);
+
+	for (keyno = 0; keyno < form->partnatts; keyno++)
+	{
+		AttrNumber	attnum = form->partattrs.values[keyno];
+		PartitionElem *pelem;
+		Oid			keycolcollation;
+		Oid			partcoll;
+
+		pelem = makeNode(PartitionElem);
+		pelem->location = -1;
+
+		if (attnum != 0)
+		{
+			/* Simple column reference */
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+			pelem->name = pstrdup(NameStr(attr->attname));
+			pelem->expr = NULL;
+			keycolcollation = attr->attcollation;
+		}
+		else
+		{
+			/*
+			 * Expression-based partition key.
+			 *
+			 * The partexprs list contains the partition key expressions in
+			 * their internal node representation, previously extracted from
+			 * pg_partitioned_table.partexprs. We need to convert each
+			 * expression back to SQL text form for use in CREATE TABLE.
+			 */
+			Node	   *partexpr;
+
+			Assert(partexpr_item != NULL);
+
+			/*
+			 * Fetch the current expression and advance the iterator.
+			 * partexprs contains only expressions (not simple column refs),
+			 * so we consume them in order as we encounter expression-based
+			 * partition keys (attnum == 0) while iterating through partattrs.
+			 */
+			partexpr = (Node *) lfirst(partexpr_item);
+			partexpr_item = lnext(partexprs, partexpr_item);
+
+			pelem->name = NULL;
+			pelem->expr = partexpr;
+			keycolcollation = exprCollation(partexpr);
+
+			partspec->is_transformed = true;
+		}
+
+		/* Handle collation */
+		partcoll = partcollation->values[keyno];
+		if (OidIsValid(partcoll) && partcoll != keycolcollation)
+			pelem->collation = list_make1(makeString(generate_collation_name(partcoll)));
+		else
+			pelem->collation = NIL;
+
+		/* Handle opclass - only include if not default */
+		pelem->opclass = NIL;
+
+		partspec->partParams = lappend(partspec->partParams, pelem);
+	}
+
+	relation_close(rel, AccessShareLock);
+	ReleaseSysCache(tuple);
+
+	return partspec;
+}
 
 /*
  * Subroutine for CREATE SCHEMA LIKE.
  *
- * It return a list of CreateStmt statements for tables that are on source
- * schema that should be created on target schema.
+ * It returns a list of CreateStmt statements for tables that are in the source
+ * schema that should be created in the target schema.
  *
- * It uses CREATE TABLE ... LIKE existing infrastructure.
+ * It uses CREATE TABLE ... LIKE existing infrastructure, with special handling
+ * for partitioned tables and their partitions:
+ *
+ * - Partitioned tables are created with their partition specification preserved.
+ * - Partitions whose parent table is in the same schema are attached to the
+ *   new parent table in the target schema.
+ * - Partitions whose parent table is in a different schema are skipped with
+ *   a WARNING, since we cannot recreate the partition relationship.
+ *
+ * The returned list is ordered so that partitioned tables appear before their
+ * partitions, ensuring correct creation order.
  */
 static List *
 collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 						bits32 options)
 {
+	List	   *regularTables = NIL;
+	List	   *partitionedTables = NIL;
+	List	   *partitions = NIL;
 	List	   *result = NIL;
 	bool		preserveIndexNames = false;
 	Relation	pg_class;
@@ -63,6 +243,10 @@ collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 	ScanKeyData key;
 	HeapTuple	tuple;
 	bits32		tableOptions;
+	char	   *srcSchemaName;
+	ListCell   *lc;
+
+	srcSchemaName = get_namespace_name(srcNspOid);
 
 	/*
 	 * Determine CREATE TABLE LIKE options. We copy most properties by
@@ -105,6 +289,7 @@ collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
 		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+		Oid			relOid = classForm->oid;
 		CreateStmt *createStmt;
 		TableLikeClause *likeClause;
 		RangeVar   *newRelation;
@@ -114,6 +299,33 @@ collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 		if (classForm->relkind != RELKIND_RELATION &&
 			classForm->relkind != RELKIND_PARTITIONED_TABLE)
 			continue;
+
+		/*
+		 * Check if this is a partition. Partitions need special handling.
+		 */
+		if (classForm->relispartition)
+		{
+			Oid			parentOid;
+			Oid			parentNspOid;
+
+			parentOid = get_partition_parent(relOid, false);
+			parentNspOid = get_rel_namespace(parentOid);
+
+			/*
+			 * If the parent is in a different schema, skip this partition
+			 * with a warning. We cannot recreate the partition relationship
+			 * since the parent table is not being copied.
+			 */
+			if (parentNspOid != srcNspOid)
+			{
+				ereport(WARNING,
+						(errmsg("skipping partition \"%s.%s\" because its parent table is in schema \"%s\"",
+								srcSchemaName,
+								NameStr(classForm->relname),
+								get_namespace_name(parentNspOid))));
+				continue;
+			}
+		}
 
 		createStmt = makeNode(CreateStmt);
 		likeClause = makeNode(TableLikeClause);
@@ -125,7 +337,7 @@ collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 		newRelation->relpersistence = classForm->relpersistence;
 
 		/* Source table reference */
-		sourceRelation = makeRangeVar(get_namespace_name(srcNspOid),
+		sourceRelation = makeRangeVar(pstrdup(srcSchemaName),
 									  pstrdup(NameStr(classForm->relname)),
 									  -1);
 
@@ -144,21 +356,65 @@ collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 		createStmt->nnconstraints = NIL;
 		createStmt->options = NIL;
 		createStmt->oncommit = ONCOMMIT_NOOP;
-
-		/*
-		 * XXX: Should we have INCLUDING TABLESPACE? If not, should we use the
-		 * same tablespace of source table?
-		 */
 		createStmt->tablespacename = NULL;
 		createStmt->accessMethod = NULL;
 		createStmt->if_not_exists = false;
 
+		/*
+		 * Handle partitioned tables: preserve the partition specification.
+		 */
+		if (classForm->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			createStmt->partspec = buildPartitionSpecForRelation(relOid);
+			partitionedTables = lappend(partitionedTables, createStmt);
+		}
 
-		result = lappend(result, createStmt);
+		/*
+		 * Handle partitions: set up inheritance and partition bound to attach
+		 * this partition to the parent table in the new schema.
+		 */
+		else if (classForm->relispartition)
+		{
+			Oid			parentOid;
+			char	   *parentName;
+			RangeVar   *parent;
+
+			parentOid = get_partition_parent(relOid, false);
+			parentName = get_rel_name(parentOid);
+
+			/* Reference to parent in new schema */
+			parent = makeRangeVar(pstrdup(newSchemaName),
+								  pstrdup(parentName),
+								  -1);
+
+			createStmt->inhRelations = list_make1(parent);
+			createStmt->partbound = getPartitionBoundSpec(relOid);
+
+			partitions = lappend(partitions, createStmt);
+		}
+		else
+		{
+			/* Regular table */
+			regularTables = lappend(regularTables, createStmt);
+		}
 	}
 
 	systable_endscan(scan);
 	table_close(pg_class, AccessShareLock);
+
+	/*
+	 * Build the result list in proper order: regular tables first, then
+	 * partitioned tables, then partitions. This ensures parent tables exist
+	 * before their partitions are created.
+	 */
+	foreach(lc, regularTables)
+		result = lappend(result, lfirst(lc));
+
+	foreach(lc, partitionedTables)
+		result = lappend(result, lfirst(lc));
+
+	foreach(lc, partitions)
+		result = lappend(result, lfirst(lc));
 
 	return result;
 }

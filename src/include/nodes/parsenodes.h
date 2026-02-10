@@ -916,6 +916,8 @@ typedef struct PartitionSpec
 	PartitionStrategy strategy;
 	List	   *partParams;		/* List of PartitionElems */
 	ParseLoc	location;		/* token location, or -1 if unknown */
+
+	bool		is_transformed;
 } PartitionSpec;
 
 /*
@@ -927,6 +929,8 @@ typedef struct PartitionSpec
 struct PartitionBoundSpec
 {
 	NodeTag		type;
+
+	bool		is_transformed;
 
 	char		strategy;		/* see PARTITION_STRATEGY codes above */
 	bool		is_default;		/* is it a default partition bound? */

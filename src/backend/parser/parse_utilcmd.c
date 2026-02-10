@@ -4612,6 +4612,15 @@ transformPartitionBound(ParseState *pstate, Relation parent,
 	int			partnatts = get_partition_natts(key);
 	List	   *partexprs = get_partition_exprs(key);
 
+	/*
+	 * Check if the bound specification is already in transformed form (i.e.,
+	 * it was retrieved from pg_class.relpartbound rather than parsed from
+	 * SQL). This happens when copying partitions via CREATE SCHEMA ... LIKE.
+	 * In this case, skip transformation and return a copy of the input.
+	 */
+	if (spec->is_transformed)
+			return copyObject(spec);
+
 	/* Avoid scribbling on input */
 	result_spec = copyObject(spec);
 

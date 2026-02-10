@@ -80,7 +80,7 @@ CREATE TABLE regress_source_schema.t1 (
 );
 
 CREATE TABLE regress_source_schema.t2 (
-    id int REFERENCES regress_source_schema.t1(id),
+    id int,
     data jsonb
 );
 
@@ -222,6 +222,104 @@ CREATE SCHEMA regress_hash_part_copy LIKE regress_hash_part_source INCLUDING ALL
 
 -- Verify hash partitioned table structure and that partitions were attached correctly
 \d+ regress_hash_part_copy.events
+
+--
+-- Test foreign key handling
+--
+
+-- Create a schema with tables that have FK relationships within the schema
+CREATE SCHEMA regress_fk_source;
+
+CREATE TABLE regress_fk_source.parent (
+    id int PRIMARY KEY,
+    name text
+);
+
+CREATE TABLE regress_fk_source.child (
+    id int PRIMARY KEY,
+    parent_id int REFERENCES regress_fk_source.parent(id) ON DELETE CASCADE,
+    data text
+);
+
+-- Add another FK relationship
+CREATE TABLE regress_fk_source.grandchild (
+    id int PRIMARY KEY,
+    child_id int REFERENCES regress_fk_source.child(id) ON UPDATE CASCADE ON DELETE SET NULL,
+    info text
+);
+
+-- Test ON DELETE SET NULL with column list (fk_del_set_cols)
+CREATE TABLE regress_fk_source.multi_col_parent (
+    id int,
+    sub_id int,
+    PRIMARY KEY (id, sub_id)
+);
+
+CREATE TABLE regress_fk_source.multi_col_child (
+    id int PRIMARY KEY,
+    parent_id int,
+    parent_sub_id int,
+    extra_data text,
+    FOREIGN KEY (parent_id, parent_sub_id)
+        REFERENCES regress_fk_source.multi_col_parent(id, sub_id)
+        ON DELETE SET NULL (parent_id)  -- only parent_id set to NULL, not parent_sub_id
+);
+
+-- Copy the schema - FKs should be recreated pointing to new schema tables
+CREATE SCHEMA regress_fk_copy LIKE regress_fk_source INCLUDING ALL;
+
+-- Verify the FK constraints were copied and actions were preserved
+\d regress_fk_copy.child
+\d regress_fk_copy.grandchild
+
+-- Verify ON DELETE SET NULL (column_list) was preserved
+\d regress_fk_copy.multi_col_child
+
+-- Test FK to external schema (should be skipped with WARNING)
+CREATE SCHEMA regress_fk_external;
+
+CREATE TABLE regress_fk_external.external_ref (
+    id int PRIMARY KEY
+);
+
+CREATE SCHEMA regress_fk_mixed;
+
+CREATE TABLE regress_fk_mixed.internal_parent (
+    id int PRIMARY KEY
+);
+
+-- Table with FK to table in same schema (should be copied)
+CREATE TABLE regress_fk_mixed.internal_child (
+    id int PRIMARY KEY,
+    parent_id int REFERENCES regress_fk_mixed.internal_parent(id)
+);
+
+-- Table with FK to external schema (FK should be skipped with WARNING)
+CREATE TABLE regress_fk_mixed.external_child (
+    id int PRIMARY KEY,
+    ref_id int REFERENCES regress_fk_external.external_ref(id)
+);
+
+-- Copy should warn about external FK but copy internal FK
+CREATE SCHEMA regress_fk_mixed_copy LIKE regress_fk_mixed INCLUDING ALL;
+
+-- Verify only internal FK was copied (external FK should be skipped)
+\d regress_fk_mixed_copy.internal_child
+\d egress_fk_mixed_copy.external_child -- should be empty
+
+-- Test default EXCLUDING with FK and ensure that ALTER TABLE ADD CONSTRAINT is
+-- not executed.
+CREATE SCHEMA regress_copy_empty LIKE regress_fk_source;
+
+\d+ regress_copy_empty
+
+
+-- Clean up FK tests
+DROP SCHEMA regress_fk_source CASCADE;
+DROP SCHEMA regress_fk_copy CASCADE;
+DROP SCHEMA regress_fk_external CASCADE;
+DROP SCHEMA regress_fk_mixed CASCADE;
+DROP SCHEMA regress_fk_mixed_copy CASCADE;
 
 -- Clean up partition tests
 DROP SCHEMA regress_part_source CASCADE;

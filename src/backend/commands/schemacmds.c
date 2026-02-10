@@ -27,6 +27,7 @@
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "commands/event_trigger.h"
@@ -48,6 +49,7 @@
 static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
 static List *collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 									 bits32 options);
+static List *collectSchemaForeignKeysLike(Oid srcNspOid, const char *newSchemaName);
 static PartitionSpec *buildPartitionSpecForRelation(Oid relid);
 static PartitionBoundSpec *getPartitionBoundSpec(Oid partOid);
 
@@ -420,6 +422,157 @@ collectSchemaTablesLike(Oid srcNspOid, const char *newSchemaName,
 }
 
 /*
+ * Collect foreign key constraints from source schema tables.
+ *
+ * Returns a list of AlterTableStmt nodes that add FK constraints to tables
+ * in the new schema. Only FKs that reference tables within the same source
+ * schema are included; FKs referencing external schemas are skipped with
+ * a WARNING.
+ *
+ * This must be called after tables are created, as FKs require both the
+ * referencing and referenced tables to exist.
+ */
+static List *
+collectSchemaForeignKeysLike(Oid srcNspOid, const char *newSchemaName)
+{
+	List	   *result = NIL;
+	Relation	pg_constraint;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	char	   *srcSchemaName;
+	ScanKeyData key;
+
+	srcSchemaName = get_namespace_name(srcNspOid);
+
+	ScanKeyInit(&key,
+				Anum_pg_constraint_connamespace,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(srcNspOid));
+
+	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+
+	/* Scan constraints filtering for FKs on source schema tables */
+	scan = systable_beginscan(pg_constraint, InvalidOid, false,
+							  NULL, 1, &key);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
+		Oid			relid = con->conrelid;
+		Oid			confrelid = con->confrelid;
+		Oid			refNspOid;
+		AlterTableStmt *alterStmt;
+		AlterTableCmd *cmd;
+		Constraint *fkcon;
+		RangeVar   *rel;
+		RangeVar   *pktable;
+		int			numkeys;
+		AttrNumber	conkey[INDEX_MAX_KEYS];
+		AttrNumber	confkey[INDEX_MAX_KEYS];
+		char	   *relname;
+		char	   *refrelname;
+		AttrNumber	fkdelsetcols[INDEX_MAX_KEYS];
+		int			numfkdelsetcols;
+
+
+		/* Only process foreign key constraints */
+		if (con->contype != CONSTRAINT_FOREIGN)
+			continue;
+
+		/* Check if referenced table is in source schema */
+		refNspOid = get_rel_namespace(confrelid);
+		if (refNspOid != srcNspOid)
+		{
+			ereport(WARNING,
+					(errmsg("skipping foreign key \"%s\" on table \"%s.%s\" because it references table \"%s.%s\" in a different schema",
+							NameStr(con->conname),
+							srcSchemaName,
+							get_rel_name(relid),
+							get_namespace_name(refNspOid),
+							get_rel_name(confrelid))));
+			continue;
+		}
+
+		/* Extract FK constraint details */
+		DeconstructFkConstraintRow(tuple, &numkeys, conkey, confkey,
+								   NULL, NULL, NULL,
+								   &numfkdelsetcols, fkdelsetcols);
+
+		/* Build the Constraint node for the FK */
+		fkcon = makeNode(Constraint);
+		fkcon->contype = CONSTR_FOREIGN;
+		fkcon->conname = pstrdup(NameStr(con->conname));
+		fkcon->deferrable = con->condeferrable;
+		fkcon->initdeferred = con->condeferred;
+		fkcon->is_enforced = con->conenforced;
+		fkcon->skip_validation = false;
+		fkcon->initially_valid = con->convalidated;
+		fkcon->location = -1;
+
+		/* Build FK column list */
+		relname = get_rel_name(relid);
+		fkcon->fk_attrs = NIL;
+		for (int i = 0; i < numkeys; i++)
+		{
+			char	   *attname = get_attname(relid, conkey[i], false);
+
+			fkcon->fk_attrs = lappend(fkcon->fk_attrs, makeString(attname));
+		}
+
+		/* Build PK column list and reference table */
+		refrelname = get_rel_name(confrelid);
+		pktable = makeRangeVar(pstrdup(newSchemaName),
+							   pstrdup(refrelname),
+							   -1);
+		fkcon->pktable = pktable;
+		fkcon->pk_attrs = NIL;
+		for (int i = 0; i < numkeys; i++)
+		{
+			char	   *attname = get_attname(confrelid, confkey[i], false);
+
+			fkcon->pk_attrs = lappend(fkcon->pk_attrs, makeString(attname));
+		}
+
+		/* Set FK actions */
+		fkcon->fk_matchtype = con->confmatchtype;
+		fkcon->fk_upd_action = con->confupdtype;
+		fkcon->fk_del_action = con->confdeltype;
+		fkcon->fk_del_set_cols = NIL;
+		/* Handle ON DELETE SET NULL/DEFAULT (col1, col2, ...) */
+		for (int i = 0; i < numfkdelsetcols; i++)
+		{
+			char	   *attname = get_attname(relid, fkdelsetcols[i], false);
+
+			fkcon->fk_del_set_cols = lappend(fkcon->fk_del_set_cols,
+											 makeString(attname));
+		}
+
+		/* Build ALTER TABLE ADD CONSTRAINT statement */
+		alterStmt = makeNode(AlterTableStmt);
+		cmd = makeNode(AlterTableCmd);
+
+		rel = makeRangeVar(pstrdup(newSchemaName),
+						   pstrdup(relname),
+						   -1);
+
+		cmd->subtype = AT_AddConstraint;
+		cmd->def = (Node *) fkcon;
+
+		alterStmt->relation = rel;
+		alterStmt->cmds = list_make1(cmd);
+		alterStmt->objtype = OBJECT_TABLE;
+		alterStmt->missing_ok = false;
+
+		result = lappend(result, alterStmt);
+	}
+
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+
+	return result;
+}
+
+/*
  * CREATE SCHEMA
  *
  * Note: caller should pass in location information for the whole
@@ -444,6 +597,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	AclResult	aclresult;
 	ObjectAddress address;
 	StringInfoData pathbuf;
+	List	   *fk_stmts = NIL;
 
 	GetUserIdAndSecContext(&saved_uid, &save_sec_context);
 
@@ -570,6 +724,10 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	/*
 	 * Process LIKE clause if present.  We collect objects from the source
 	 * schema and append them to the schema elements list.
+	 *
+	 * Note: FK constraints are collected separately and executed after all
+	 * tables are created, since they require both referencing and referenced
+	 * tables to exist.
 	 */
 	if (stmt->like_clause != NULL)
 	{
@@ -596,6 +754,15 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 												 like->options);
 		}
 
+		/*
+		 * If INCLUDING TABLE INCLUDING INDEX or INCLUDING ALL is used also
+		 * collect FK's references to create on new schema.
+		 */
+		if (like->options & CREATE_SCHEMA_LIKE_ALL ||
+			(like->options & CREATE_SCHEMA_LIKE_TABLE
+			 && like->options & CREATE_TABLE_LIKE_INDEXES))
+			fk_stmts = collectSchemaForeignKeysLike(srcNspOid, schemaName);
+
 		/* Append LIKE-generated statements to explicit schema elements */
 		stmt->schemaElts = list_concat(like_stmts, stmt->schemaElts);
 	}
@@ -609,6 +776,15 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	 */
 	parsetree_list = transformCreateSchemaStmtElements(stmt->schemaElts,
 													   schemaName);
+
+
+	/*
+	 * Append foreign key constraints from LIKE clause. This must be done
+	 * after all tables are created, since FKs require both the referencing
+	 * and referenced tables to exist.
+	 */
+	if (fk_stmts != NIL)
+		parsetree_list = list_concat(parsetree_list, fk_stmts);
 
 	/*
 	 * Execute each command contained in the CREATE SCHEMA.  Since the grammar

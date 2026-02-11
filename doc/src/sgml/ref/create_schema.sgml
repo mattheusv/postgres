@@ -22,6 +22,7 @@ PostgreSQL documentation
  <refsynopsisdiv>
 <synopsis>
 CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ] [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
+CREATE SCHEMA <replaceable class="parameter">schema_name</replaceable> [ IF NOT EXISTS ] LIKE <replaceable class="parameter">source_schema</replaceable> [ <replaceable class="parameter">like_option</replaceable> [ ... ] ]
 CREATE SCHEMA AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> [ <replaceable class="parameter">schema_element</replaceable> [ ... ] ]
 CREATE SCHEMA IF NOT EXISTS <replaceable class="parameter">schema_name</replaceable> [ AUTHORIZATION <replaceable class="parameter">role_specification</replaceable> ]
 CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_specification</replaceable>
@@ -32,6 +33,10 @@ CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_sp
   | CURRENT_ROLE
   | CURRENT_USER
   | SESSION_USER
+
+<phrase>and <replaceable class="parameter">like_option</replaceable> can be:</phrase>
+
+    { INCLUDING | EXCLUDING } { TABLE | INDEX | ALL }
 </synopsis>
  </refsynopsisdiv>
 
@@ -120,6 +125,87 @@ CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_sp
        </para>
       </listitem>
      </varlistentry>
+
+     <varlistentry>
+       <term><literal>LIKE <replaceable>source_schema</replaceable> [ <replaceable>like_option</replaceable> ... ]</literal></term>
+       <listitem>
+         <para>
+           The <literal>LIKE</literal> clause specifies a schema from which the new
+           schema automatically copies the definitions of all supported objects
+           (such as tables and indexes).
+         </para>
+
+         <para>
+           The new schema and the original schema are completely decoupled after
+           creation is complete. Changes to objects in the original schema will
+           not be applied to the new schema, and changes to the new schema will
+           not affect the original.
+         </para>
+
+         <para>
+           Only objects that are self-contained within the source schema or
+           reference other objects within that same schema are copied. Any object
+           that references an object located in a different schema will be
+           skipped. For example, a foreign key referencing a table in a
+           different schema, or an index on a table located elsewhere, will
+           not be created in the new schema.
+         </para>
+
+         <para>
+           The optional <replaceable>like_option</replaceable> clauses specify
+           which additional properties of the original schema's objects to copy.
+           Specifying <literal>INCLUDING</literal> copies the object, while
+           specifying <literal>EXCLUDING</literal> omits the object.
+           <literal>EXCLUDING</literal> is the default. If multiple
+           specifications are made for the same kind of object, the last one
+           is used. The available options are:
+         </para>
+
+         <variablelist>
+           <varlistentry>
+             <term><literal>INCLUDING TABLE</literal></term>
+             <listitem>
+               <para>
+                 Definitions of tables, partitioned tables, and their associated
+                 sequences for identity columns are copied to the new schema.
+                 Foreign keys are re-created in the new schema only if the
+                 referenced table is also part of the source schema.
+               </para>
+               <para>
+                 Partitioned tables are supported, provided that the parent
+                 table and all of its partitions are defined within the source
+                 schema. If a partition or its parent table resides in a
+                 different schema, that specific object will be skipped.
+               </para>
+               <para>
+                 Note that for <type>SERIAL</type> data types, the sequence is
+                 shared with the source schema; a new sequence is not created
+                 for the new table, meaning the new table's column will default
+                 to the original sequence.
+               </para>
+             </listitem>
+           </varlistentry>
+
+           <varlistentry>
+             <term><literal>INCLUDING INDEX</literal></term>
+             <listitem>
+               <para>
+                 Indexes from the source schema will be created on the new tables,
+                 provided the index does not reference objects in a different
+                 schema. This option only takes effect if
+                 <literal>INCLUDING TABLE</literal> is also active. If tables
+                 are excluded (either by default or explicitly), indexes will
+                 not be created, as they have no parent object to attach to.
+                 For example, <literal>CREATE SCHEMA foo LIKE bar INCLUDING INDEX</literal>
+                 or <literal>CREATE SCHEMA foo LIKE bar INCLUDING ALL EXCLUDING TABLE</literal>
+                 will result in no indexes being created.
+               </para>
+             </listitem>
+           </varlistentry>
+         </variablelist>
+       </listitem>
+     </varlistentry>
+
     </variablelist>
  </refsect1>
 
@@ -128,8 +214,10 @@ CREATE SCHEMA IF NOT EXISTS AUTHORIZATION <replaceable class="parameter">role_sp
 
   <para>
    To create a schema, the invoking user must have the
-   <literal>CREATE</literal> privilege for the current database.
-   (Of course, superusers bypass this check.)
+   <literal>CREATE</literal> privilege for the current database. For
+   <literal>LIKE</literal> the user also must have the <literal>USAGE</literal>
+   privilege on the source schema.
+   (Of course, superusers bypass these checks.)
   </para>
  </refsect1>
 

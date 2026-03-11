@@ -784,6 +784,82 @@ SELECT count(*) FROM t WHERE i = 15 AND g IN (SELECT g + 10 FROM t WHERE i = 5);
 DROP TABLE t;
 
 
+--
+-- Test that extension dependencies on partition indexes are preserved
+-- after MERGE PARTITIONS.
+--
+CREATE EXTENSION IF NOT EXISTS test_ext3;
+CREATE EXTENSION IF NOT EXISTS test_ext5;
+
+CREATE TABLE t_merge_extdep (i int, x int, y int) PARTITION BY RANGE (i);
+CREATE TABLE t_merge_extdep_1 PARTITION OF t_merge_extdep FOR VALUES FROM (1) TO (2);
+CREATE TABLE t_merge_extdep_2 PARTITION OF t_merge_extdep FOR VALUES FROM (2) TO (3);
+CREATE TABLE t_merge_extdep_3 PARTITION OF t_merge_extdep FOR VALUES FROM (3) TO (4);
+CREATE TABLE t_merge_extdep_4 PARTITION OF t_merge_extdep FOR VALUES FROM (4) TO (5);
+CREATE TABLE t_merge_extdep_5 PARTITION OF t_merge_extdep FOR VALUES FROM (5) TO (6); -- Don't have a dependency
+CREATE INDEX t_merge_extdep_idx ON t_merge_extdep(i);
+CREATE INDEX t_merge_extdep_x ON t_merge_extdep(x);
+
+-- Add extension dependency for some partition indexes
+ALTER INDEX t_merge_extdep_1_i_idx DEPENDS ON EXTENSION test_ext3;
+ALTER INDEX t_merge_extdep_1_x_idx DEPENDS ON EXTENSION test_ext5;
+ALTER INDEX t_merge_extdep_2_i_idx DEPENDS ON EXTENSION test_ext3;
+ALTER INDEX t_merge_extdep_2_x_idx DEPENDS ON EXTENSION test_ext5;
+ALTER INDEX t_merge_extdep_3_i_idx DEPENDS ON EXTENSION test_ext3;
+ALTER INDEX t_merge_extdep_3_x_idx DEPENDS ON EXTENSION test_ext5;
+
+-- Add only a single dependency to test that it fails when merge partition with
+-- different extension dependencies.
+ALTER INDEX t_merge_extdep_4_i_idx DEPENDS ON EXTENSION test_ext5;
+
+-- Should fail: dependencies exist
+DROP EXTENSION test_ext3;
+
+-- Merge partitions
+ALTER TABLE t_merge_extdep MERGE PARTITIONS (t_merge_extdep_1, t_merge_extdep_2) INTO t_merge_extdep_merged;
+
+-- Should still fail: dependencies should be preserved on the new partition's index
+DROP EXTENSION test_ext3;
+
+-- Verify that dependencies for all indexes exists in pg_depend
+SELECT relname, extname
+FROM pg_depend d
+JOIN pg_class c ON d.objid = c.oid
+JOIN pg_extension e ON d.refobjid = e.oid
+WHERE c.relname IN ('t_merge_extdep_merged_i_idx', 't_merge_extdep_merged_x_idx')
+  AND e.extname IN ('test_ext3', 'test_ext5')
+  AND d.deptype = 'x'
+ORDER BY relname, extname;
+
+-- Create an index directly on a partition (without a parent partitioned index).
+-- Such indexes are not recreated on merge because they have no parent to map to.
+-- This test verifies that partition-only indexes don't cause issues during merge.
+CREATE INDEX t_merge_extdep_3_y_idx ON t_merge_extdep_3(y);
+ALTER TABLE t_merge_extdep MERGE PARTITIONS (t_merge_extdep_merged, t_merge_extdep_3) INTO t_merge_extdep_merged2;
+
+-- The partition-only index is dropped with its partition
+SELECT relname
+FROM pg_class
+WHERE relname LIKE 't_merge_extdep_merged2%idx'
+ORDER BY relname;
+
+-- Should fail: Partitions to be merged have different extension dependencies.
+-- Also test with different ordering to ensure correctness.
+ALTER TABLE t_merge_extdep MERGE PARTITIONS (t_merge_extdep_merged2, t_merge_extdep_4) INTO t_merge_extdep_merged3;
+ALTER TABLE t_merge_extdep MERGE PARTITIONS (t_merge_extdep_4, t_merge_extdep_merged2) INTO t_merge_extdep_merged3;
+
+-- Should fail: Partitions to be merged have different extension dependencies
+-- (t_merge_extdep_5 don't have dependencies)
+-- Also test with different ordering to ensure correctness.
+ALTER TABLE t_merge_extdep MERGE PARTITIONS (t_merge_extdep_4, t_merge_extdep_5) INTO t_merge_extdep_merged3;
+ALTER TABLE t_merge_extdep MERGE PARTITIONS (t_merge_extdep_5, t_merge_extdep_4) INTO t_merge_extdep_merged3;
+
+-- Clean up
+DROP TABLE t_merge_extdep;
+DROP EXTENSION test_ext3;
+DROP EXTENSION test_ext5;
+
+
 RESET search_path;
 
 --

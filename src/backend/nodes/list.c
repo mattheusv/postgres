@@ -1220,6 +1220,32 @@ list_intersection_int(const List *list1, const List *list2)
 }
 
 /*
+ * As list_intersection but operates on lists of oids.
+ */
+List *
+list_intersection_oid(const List *list1, const List *list2)
+{
+	List	   *result;
+	const ListCell *cell;
+
+	if (list1 == NIL || list2 == NIL)
+		return NIL;
+
+	Assert(IsOidList(list1));
+	Assert(IsOidList(list2));
+
+	result = NIL;
+	foreach(cell, list1)
+	{
+		if (list_member_oid(list2, lfirst_oid(cell)))
+			result = lappend_oid(result, lfirst_oid(cell));
+	}
+
+	check_list_invariants(result);
+	return result;
+}
+
+/*
  * Return a list that contains all the cells in list1 that are not in
  * list2. The returned list is freshly allocated via palloc(), but the
  * cells themselves point to the same objects as the cells of the

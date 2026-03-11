@@ -1127,6 +1127,45 @@ SELECT count(*) FROM t WHERE i = 0 AND tab_id IN (SELECT tab_id FROM t WHERE i =
 DROP TABLE t;
 
 
+--
+-- Test that extension dependencies on partition indexes are preserved
+-- after SPLIT PARTITION.
+--
+CREATE EXTENSION citext;
+
+CREATE TABLE t_extdep (i int) PARTITION BY RANGE (i);
+CREATE TABLE t_extdep_1_3 PARTITION OF t_extdep FOR VALUES FROM (1) TO (3);
+CREATE INDEX t_extdep_idx ON t_extdep (i);
+
+-- Add extension dependency on partition index
+ALTER INDEX t_extdep_1_3_i_idx DEPENDS ON EXTENSION citext;
+
+-- Should fail: dependency exists
+DROP EXTENSION citext;
+
+-- Split partition
+ALTER TABLE t_extdep SPLIT PARTITION t_extdep_1_3 INTO
+  (PARTITION t_extdep_1 FOR VALUES FROM (1) TO (2),
+   PARTITION t_extdep_2 FOR VALUES FROM (2) TO (3));
+
+-- Should still fail: dependencies should be preserved on all new partitions' indexes
+DROP EXTENSION citext;
+
+-- Verify the dependencies exist in pg_depend for both new partitions
+SELECT c.relname, COUNT(*) > 0 AS has_ext_dep
+FROM pg_depend d
+JOIN pg_class c ON d.objid = c.oid
+JOIN pg_extension e ON d.refobjid = e.oid
+WHERE c.relname IN ('t_extdep_1_i_idx', 't_extdep_2_i_idx')
+  AND e.extname = 'citext'
+  AND d.deptype = 'x'
+GROUP BY c.relname
+ORDER BY c.relname;
+
+-- Clean up
+DROP TABLE t_extdep;
+DROP EXTENSION citext;
+
 RESET search_path;
 
 --

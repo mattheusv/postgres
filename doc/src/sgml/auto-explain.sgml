@@ -299,6 +299,25 @@ LOAD 'auto_explain';
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry id="auto-explain-configuration-parameters-log-options">
+    <term>
+     <varname>auto_explain.log_options</varname> (<type>string</type>)
+     <indexterm>
+      <primary><varname>auto_explain.log_options</varname> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      <varname>auto_explain.log_options</varname> specifies a comma-separated list
+      of custom <command>EXPLAIN</command> options registered by extensions.
+      This allows <filename>auto_explain</filename> to include output from
+      extension-provided <command>EXPLAIN</command> options when logging query
+      plans.  The default is an empty string, meaning no custom options are
+      enabled. Only superusers can change this setting.
+     </para>
+    </listitem>
+   </varlistentry>
   </variablelist>
 
   <para>

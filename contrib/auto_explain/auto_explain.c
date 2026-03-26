@@ -20,7 +20,11 @@
 #include "commands/explain_state.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/planner.h"
+#include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/varlena.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "auto_explain",
@@ -41,6 +45,7 @@ static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static int	auto_explain_log_level = LOG;
 static bool auto_explain_log_nested_statements = false;
 static double auto_explain_sample_rate = 1;
+static char *auto_explain_log_options = NULL;
 
 static const struct config_enum_entry format_options[] = {
 	{"text", EXPLAIN_FORMAT_TEXT, false},
@@ -76,11 +81,15 @@ static bool current_query_sampled = false;
 	 current_query_sampled)
 
 /* Saved hook values */
+static planner_setup_hook_type prev_planner_setup = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
+static void explain_planner_setup(PlannerGlobal *glob, Query *parse,
+								  const char *query_string, int cursorOptions,
+								  double *tuple_fraction, ExplainState *es);
 static void explain_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void explain_ExecutorRun(QueryDesc *queryDesc,
 								ScanDirection direction,
@@ -88,6 +97,125 @@ static void explain_ExecutorRun(QueryDesc *queryDesc,
 static void explain_ExecutorFinish(QueryDesc *queryDesc);
 static void explain_ExecutorEnd(QueryDesc *queryDesc);
 
+/*
+ * Apply custom EXPLAIN options from auto_explain.log_options to the
+ * ExplainState.
+ *
+ * This parses the comma-separated option list and calls
+ * ApplyExtensionExplainOption for each one.
+ */
+static void
+apply_custom_options(ExplainState *es)
+{
+	char	   *options;
+	List	   *elemlist;
+	ListCell   *lc;
+
+	if (auto_explain_log_options == NULL || auto_explain_log_options[0] == '\0')
+		return;
+
+	options = pstrdup(auto_explain_log_options);
+
+	if (!SplitIdentifierString(options, ',', &elemlist))
+	{
+		/* Shouldn't happen since check_explain_options validated this */
+		Assert(false);
+		pfree(options);
+		return;
+	}
+
+	foreach(lc, elemlist)
+	{
+		const char *option = (const char *) lfirst(lc);
+		DefElem    *def;
+
+		/*
+		 * Create a DefElem for this option. Pass NULL as the argument, which
+		 * for boolean options means "true".
+		 */
+		def = makeDefElem(pstrdup(option), NULL, -1);
+
+		/*
+		 * Apply the option. If the extension that registered this option is
+		 * not loaded, ApplyExtensionExplainOption will return false, which we
+		 * silently ignore. This allows the GUC to be set even if the
+		 * extension providing the option isn't currently loaded.
+		 *
+		 * XXX: ParseState is not used by pg_plan_advice and pg_overexplain.
+		 * Using NULL is a problem for future extensions?
+		 */
+		ApplyExtensionExplainOption(es, def, NULL);
+	}
+
+	pfree(options);
+	list_free(elemlist);
+}
+
+/* GUC check hook for auto_explain.log_options. */
+static bool
+check_explain_options(char **newval, void **extra, GucSource source)
+{
+	char	   *options;
+	List	   *elemlist;
+
+	if (*newval == NULL || (*newval)[0] == '\0')
+		return true;
+
+	/* Make a modifiable copy */
+	options = pstrdup(*newval);
+
+	if (!SplitIdentifierString(options, ',', &elemlist))
+	{
+		GUC_check_errdetail("Invalid syntax in option list.");
+		pfree(options);
+		list_free(elemlist);
+		return false;
+	}
+
+	pfree(options);
+	list_free(elemlist);
+	return true;
+}
+
+/*
+ * Planner setup hook: pass custom EXPLAIN options to planner extensions.
+ *
+ * Extensions like pg_plan_advice need to know about custom EXPLAIN options
+ * during planning so they can generate data that will be displayed later.
+ * When auto_explain.log_options is configured and auto_explain is potentially
+ * active, we create an ExplainState with those options and pass it to the
+ * planner hook chain.
+ */
+static void
+explain_planner_setup(PlannerGlobal *glob, Query *parse,
+					  const char *query_string, int cursorOptions,
+					  double *tuple_fraction, ExplainState *es)
+{
+	/*
+	 * If auto_explain is potentially active (log_min_duration >= 0) and we
+	 * have custom options configured, create an ExplainState with those
+	 * options applied. This signals to extensions like pg_plan_advice that
+	 * they should generate data for these options.
+	 *
+	 * We do this even if the caller already provided an ExplainState (i.e.,
+	 * we're inside an EXPLAIN command), because our options might differ.
+	 * However, if an ExplainState is already provided, extensions will see
+	 * that one first, so we only create ours if es is NULL.
+	 */
+	if (auto_explain_log_min_duration >= 0 &&
+		auto_explain_log_options != NULL &&
+		auto_explain_log_options[0] != '\0')
+	{
+		if (es == NULL)
+			es = NewExplainState();
+
+		apply_custom_options(es);
+	}
+
+	if (prev_planner_setup)
+		prev_planner_setup(glob, parse, query_string, cursorOptions,
+						   tuple_fraction, es);
+}
 
 /*
  * Module load callback
@@ -245,9 +373,22 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomStringVariable("auto_explain.log_options",
+							   "Custom EXPLAIN options to include in plan logging.",
+							   "Comma-separated list of custom EXPLAIN options registered by extensions. ",
+							   &auto_explain_log_options,
+							   NULL,
+							   PGC_SUSET,
+							   GUC_LIST_INPUT,
+							   check_explain_options,
+							   NULL,
+							   NULL);
+
 	MarkGUCPrefixReserved("auto_explain");
 
 	/* Install hooks. */
+	prev_planner_setup = planner_setup_hook;
+	planner_setup_hook = explain_planner_setup;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = explain_ExecutorStart;
 	prev_ExecutorRun = ExecutorRun_hook;
@@ -404,6 +545,9 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			es->format = auto_explain_log_format;
 			es->settings = auto_explain_log_settings;
 
+			/* Apply any custom EXPLAIN options */
+			apply_custom_options(es);
+
 			ExplainBeginOutput(es);
 			ExplainQueryText(es, queryDesc);
 			ExplainQueryParameters(es, queryDesc->params, auto_explain_log_parameter_max_length);
@@ -412,6 +556,19 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 				ExplainPrintTriggers(es, queryDesc);
 			if (es->costs)
 				ExplainPrintJITSummary(es, queryDesc);
+
+			/*
+			 * Allow plugins to print additional EXPLAIN information. This
+			 * mirrors what ExplainOnePlan does, allowing extensions that use
+			 * explain_per_plan_hook to add their output.
+			 */
+			if (explain_per_plan_hook)
+				(*explain_per_plan_hook) (queryDesc->plannedstmt,
+										  NULL, /* into */
+										  es,
+										  debug_query_string,
+										  queryDesc->params,
+										  queryDesc->estate->es_queryEnv);
 			ExplainEndOutput(es);
 
 			/* Remove last line break */

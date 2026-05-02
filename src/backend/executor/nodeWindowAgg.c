@@ -36,15 +36,19 @@
 #include "access/htup_details.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_aggregate.h"
+#include "common/int.h"
 #include "catalog/pg_proc.h"
 #include "common/int.h"
 #include "executor/executor.h"
+#include "executor/execRPR.h"
 #include "executor/instrument.h"
 #include "executor/nodeWindowAgg.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/plannodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/rpr.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "utils/acl.h"
@@ -174,6 +178,7 @@ typedef struct WindowStatePerAggData
 	bool		restart;		/* need to restart this agg in this cycle? */
 } WindowStatePerAggData;
 
+
 static void initialize_windowaggregate(WindowAggState *winstate,
 									   WindowStatePerFunc perfuncstate,
 									   WindowStatePerAgg peraggstate);
@@ -210,6 +215,9 @@ static Datum GetAggInitVal(Datum textInitVal, Oid transtype);
 
 static bool are_peers(WindowAggState *winstate, TupleTableSlot *slot1,
 					  TupleTableSlot *slot2);
+static int	WinGetSlotInFrame(WindowObject winobj, TupleTableSlot *slot,
+							  int relpos, int seektype, bool set_mark,
+							  bool *isnull, bool *isout);
 static bool window_gettupleslot(WindowObject winobj, int64 pos,
 								TupleTableSlot *slot);
 
@@ -228,6 +236,19 @@ static uint8 get_notnull_info(WindowObject winobj,
 							  int64 pos, int argno);
 static void put_notnull_info(WindowObject winobj,
 							 int64 pos, int argno, bool isnull);
+static bool rpr_is_defined(WindowAggState *winstate);
+static int64 row_is_in_reduced_frame(WindowObject winobj, int64 pos);
+
+static void clear_reduced_frame(WindowAggState *winstate);
+static int	get_reduced_frame_status(WindowAggState *winstate, int64 pos);
+static void update_reduced_frame(WindowObject winobj, int64 pos);
+
+/* Forward declarations - NFA row evaluation */
+static bool nfa_evaluate_row(WindowObject winobj, int64 pos, bool *varMatched);
+
+/* Forward declarations - navigation offset evaluation */
+static void eval_nav_max_offset(WindowAggState *winstate, List *defineClause);
+static void eval_nav_first_offset(WindowAggState *winstate, List *defineClause);
 
 /*
  * Not null info bit array consists of 2-bit items
@@ -821,6 +842,9 @@ eval_windowaggregates(WindowAggState *winstate)
 	 *	   transition function, or
 	 *	 - we have an EXCLUSION clause, or
 	 *	 - if the new frame doesn't overlap the old one
+	 *   - if RPR (Row Pattern Recognition) is enabled, because the reduced
+	 *     frame depends on pattern matching results which can differ entirely
+	 *     from row to row, making inverse transition optimization inapplicable
 	 *
 	 * Note that we don't strictly need to restart in the last case, but if
 	 * we're going to remove all rows from the aggregation anyway, a restart
@@ -835,7 +859,8 @@ eval_windowaggregates(WindowAggState *winstate)
 			(winstate->aggregatedbase != winstate->frameheadpos &&
 			 !OidIsValid(peraggstate->invtransfn_oid)) ||
 			(winstate->frameOptions & FRAMEOPTION_EXCLUSION) ||
-			winstate->aggregatedupto <= winstate->frameheadpos)
+			winstate->aggregatedupto <= winstate->frameheadpos ||
+			rpr_is_defined(winstate))
 		{
 			peraggstate->restart = true;
 			numaggs_restart++;
@@ -964,6 +989,14 @@ eval_windowaggregates(WindowAggState *winstate)
 	{
 		winstate->aggregatedupto = winstate->frameheadpos;
 		ExecClearTuple(agg_row_slot);
+
+		/*
+		 * If RPR is defined, we do not use aggregatedupto_nonrestarted.  To
+		 * avoid assertion failure below, we reset aggregatedupto_nonrestarted
+		 * to frameheadpos.
+		 */
+		if (rpr_is_defined(winstate))
+			aggregatedupto_nonrestarted = winstate->frameheadpos;
 	}
 
 	/*
@@ -975,7 +1008,7 @@ eval_windowaggregates(WindowAggState *winstate)
 	 */
 	for (;;)
 	{
-		int			ret;
+		int64		ret;
 
 		/* Fetch next row if we didn't already */
 		if (TupIsNull(agg_row_slot))
@@ -993,8 +1026,39 @@ eval_windowaggregates(WindowAggState *winstate)
 							  agg_row_slot, false);
 		if (ret < 0)
 			break;
+
 		if (ret == 0)
 			goto next_tuple;
+
+		if (rpr_is_defined(winstate))
+		{
+			/*
+			 * If currentpos is already decided but aggregatedupto is not yet
+			 * determined, we've passed the last reduced frame.
+			 */
+			if (get_reduced_frame_status(winstate, winstate->currentpos)
+				!= RF_NOT_DETERMINED &&
+				get_reduced_frame_status(winstate, winstate->aggregatedupto)
+				== RF_NOT_DETERMINED)
+				break;
+
+			/*
+			 * Calculate the reduced frame for aggregatedupto.
+			 */
+			ret = row_is_in_reduced_frame(winstate->agg_winobj,
+										  winstate->aggregatedupto);
+			if (ret == -1)		/* unmatched row */
+				break;
+
+			/*
+			 * Check if current row is inside a match but not the head
+			 * (skipped), and it's the base row for aggregation.
+			 */
+			if (get_reduced_frame_status(winstate,
+										 winstate->aggregatedupto) == RF_SKIPPED &&
+				winstate->aggregatedupto == winstate->aggregatedbase)
+				break;
+		}
 
 		/* Set tuple context for evaluation of aggregate arguments */
 		winstate->tmpcontext->ecxt_outertuple = agg_row_slot;
@@ -1023,6 +1087,7 @@ next_tuple:
 		winstate->aggregatedupto++;
 		ExecClearTuple(agg_row_slot);
 	}
+
 
 	/* The frame's end is not supposed to move backwards, ever */
 	Assert(aggregatedupto_nonrestarted <= winstate->aggregatedupto);
@@ -1191,6 +1256,28 @@ prepare_tuplestore(WindowAggState *winstate)
 		}
 	}
 
+	/* Create read/mark pointers for RPR navigation if needed */
+	if (winstate->nav_winobj)
+	{
+		/*
+		 * Allocate mark and read pointers for RPR navigation.
+		 *
+		 * If navMaxOffsetKind == RPR_NAV_OFFSET_FIXED, we advance the mark
+		 * based on (currentpos - navMaxOffset) and optionally
+		 * (nfaContext->matchStartRow + navFirstOffset), allowing
+		 * tuplestore_trim() to free rows that are no longer reachable.
+		 *
+		 * RPR_NAV_OFFSET_NEEDS_EVAL is resolved at executor init; by this
+		 * point it is either FIXED or RETAIN_ALL.
+		 */
+		winstate->nav_winobj->markptr =
+			tuplestore_alloc_read_pointer(winstate->buffer, 0);
+		winstate->nav_winobj->readptr =
+			tuplestore_alloc_read_pointer(winstate->buffer,
+										  EXEC_FLAG_BACKWARD);
+		winstate->nav_winobj->markpos = 0;
+	}
+
 	/*
 	 * If we are in RANGE or GROUPS mode, then determining frame boundaries
 	 * requires physical access to the frame endpoint rows, except in certain
@@ -1247,6 +1334,8 @@ begin_partition(WindowAggState *winstate)
 	winstate->framehead_valid = false;
 	winstate->frametail_valid = false;
 	winstate->grouptail_valid = false;
+	if (rpr_is_defined(winstate))
+		clear_reduced_frame(winstate);
 	winstate->spooled_rows = 0;
 	winstate->currentpos = 0;
 	winstate->frameheadpos = 0;
@@ -1298,6 +1387,13 @@ begin_partition(WindowAggState *winstate)
 		/* Also reset the row counters for aggregates */
 		winstate->aggregatedbase = 0;
 		winstate->aggregatedupto = 0;
+	}
+
+	/* reset mark and seek positions for RPR navigation */
+	if (winstate->nav_winobj)
+	{
+		winstate->nav_winobj->markpos = -1;
+		winstate->nav_winobj->seekpos = -1;
 	}
 
 	/* reset mark and seek positions for each real window function */
@@ -1468,6 +1564,18 @@ release_partition(WindowAggState *winstate)
 		tuplestore_clear(winstate->buffer);
 	winstate->partition_spooled = false;
 	winstate->next_partition = true;
+
+	/* Reset RPR match results */
+	clear_reduced_frame(winstate);
+
+	/* Reset NFA state for new partition */
+	winstate->nfaContext = NULL;
+	winstate->nfaContextTail = NULL;
+	winstate->nfaContextFree = NULL;
+	winstate->nfaStateFree = NULL;
+	winstate->nfaLastProcessedRow = -1;
+	winstate->nfaStatesActive = 0;
+	winstate->nfaContextsActive = 0;
 }
 
 /*
@@ -2397,6 +2505,16 @@ ExecWindowAgg(PlanState *pstate)
 		if (winstate->status == WINDOWAGG_RUN)
 		{
 			/*
+			 * If RPR is defined and skip mode is next row, clear the current
+			 * match so the next row triggers re-evaluation.
+			 */
+			if (rpr_is_defined(winstate))
+			{
+				if (winstate->rpSkipTo == ST_NEXT_ROW)
+					clear_reduced_frame(winstate);
+			}
+
+			/*
 			 * Evaluate true window functions
 			 */
 			numfuncs = winstate->numfuncs;
@@ -2434,6 +2552,45 @@ ExecWindowAgg(PlanState *pstate)
 			update_frametailpos(winstate);
 		if (winstate->grouptail_ptr >= 0)
 			update_grouptailpos(winstate);
+
+		/*
+		 * Advance RPR navigation mark pointer if possible, so that
+		 * tuplestore_trim() can free rows no longer reachable by navigation.
+		 */
+		if (winstate->nav_winobj &&
+			winstate->rpPattern != NULL &&
+			winstate->navMaxOffsetKind == RPR_NAV_OFFSET_FIXED)
+		{
+			int64		navmarkpos;
+
+			/* Backward reach from PREV/LAST/compound PREV_LAST/NEXT_LAST */
+			if (winstate->currentpos > winstate->navMaxOffset)
+				navmarkpos = winstate->currentpos - winstate->navMaxOffset;
+			else
+				navmarkpos = 0;
+
+			/*
+			 * If FIRST is used, also consider match_start + navFirstOffset.
+			 * The oldest active context (nfaContext) has the smallest
+			 * matchStartRow.
+			 */
+			if (winstate->hasFirstNav &&
+				winstate->navFirstOffsetKind == RPR_NAV_OFFSET_FIXED &&
+				winstate->nfaContext != NULL)
+			{
+				int64		firstreach;
+
+				if (winstate->navFirstOffset > -winstate->nfaContext->matchStartRow)
+					firstreach = winstate->nfaContext->matchStartRow
+						+ winstate->navFirstOffset;
+				else
+					firstreach = 0;
+				navmarkpos = Min(navmarkpos, firstreach);
+			}
+
+			if (navmarkpos > winstate->nav_winobj->markpos)
+				WinSetMarkPosition(winstate->nav_winobj, navmarkpos);
+		}
 
 		/*
 		 * Truncate any no-longer-needed rows from the tuplestore.
@@ -2660,6 +2817,20 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	winstate->temp_slot_2 = ExecInitExtraTupleSlot(estate, scanDesc,
 												   &TTSOpsMinimalTuple);
 
+	if (node->rpPattern != NULL)
+	{
+		winstate->nav_slot = ExecInitExtraTupleSlot(estate, scanDesc,
+													&TTSOpsMinimalTuple);
+		winstate->nav_slot_pos = -1;
+
+		winstate->nav_null_slot = ExecInitExtraTupleSlot(estate, scanDesc,
+														 &TTSOpsMinimalTuple);
+		winstate->nav_null_slot = ExecStoreAllNullTuple(winstate->nav_null_slot);
+
+		winstate->nav_saved_outertuple = NULL;
+		winstate->nav_match_start = 0;
+	}
+
 	/*
 	 * create frame head and tail slots only if needed (must create slots in
 	 * exactly the same cases that update_frameheadpos and update_frametailpos
@@ -2828,6 +2999,23 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 		winstate->agg_winobj = agg_winobj;
 	}
 
+	/*
+	 * Set up WindowObject for RPR navigation opcodes.  This is separate from
+	 * agg_winobj because it needs its own read pointer to avoid interfering
+	 * with aggregate processing.
+	 */
+	if (node->rpPattern != NULL)
+	{
+		WindowObject nav_winobj = makeNode(WindowObjectData);
+
+		nav_winobj->winstate = winstate;
+		nav_winobj->argstates = NIL;
+		nav_winobj->localmem = NULL;
+		nav_winobj->markptr = -1;
+		nav_winobj->readptr = -1;
+		winstate->nav_winobj = nav_winobj;
+	}
+
 	/* Set the status to running */
 	winstate->status = WINDOWAGG_RUN;
 
@@ -2846,6 +3034,81 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	winstate->inRangeAsc = node->inRangeAsc;
 	winstate->inRangeNullsFirst = node->inRangeNullsFirst;
 
+	/* Set up SKIP TO type */
+	winstate->rpSkipTo = node->rpSkipTo;
+	/* Set up row pattern recognition PATTERN clause (compiled NFA) */
+	winstate->rpPattern = node->rpPattern;
+	/* Set up nav offsets for tuplestore trim */
+	winstate->navMaxOffsetKind = node->navMaxOffsetKind;
+	winstate->navMaxOffset = node->navMaxOffset;
+	if (winstate->navMaxOffsetKind == RPR_NAV_OFFSET_NEEDS_EVAL)
+		eval_nav_max_offset(winstate, node->defineClause);
+	winstate->hasFirstNav = node->hasFirstNav;
+	winstate->navFirstOffsetKind = node->navFirstOffsetKind;
+	winstate->navFirstOffset = node->navFirstOffset;
+	if (winstate->hasFirstNav &&
+		winstate->navFirstOffsetKind == RPR_NAV_OFFSET_NEEDS_EVAL)
+		eval_nav_first_offset(winstate, node->defineClause);
+
+	/* Copy match_start dependency bitmapset for per-context evaluation */
+	winstate->defineMatchStartDependent = bms_copy(node->defineMatchStartDependent);
+
+	/* Calculate NFA state size and allocate cycle detection bitmap */
+	if (node->rpPattern != NULL)
+	{
+		winstate->nfaStateSize = offsetof(RPRNFAState, counts) +
+			sizeof(int32) * node->rpPattern->maxDepth;
+		winstate->nfaVisitedNWords =
+			(node->rpPattern->numElements - 1) / BITS_PER_BITMAPWORD + 1;
+		winstate->nfaVisitedElems = palloc0(sizeof(bitmapword) *
+											winstate->nfaVisitedNWords);
+	}
+
+	/* Set up row pattern recognition DEFINE clause */
+	winstate->defineVariableList = NIL;
+	winstate->defineClauseList = NIL;
+	if (node->defineClause != NIL)
+	{
+		/*
+		 * Compile DEFINE clause expressions.  PREV/NEXT navigation is handled
+		 * by EEOP_RPR_NAV_SET/RESTORE opcodes emitted during ExecInitExpr, so
+		 * no varno rewriting is needed here.
+		 */
+		foreach(l, node->defineClause)
+		{
+			TargetEntry *te = lfirst(l);
+			char	   *name = te->resname;
+			Expr	   *expr = te->expr;
+			ExprState  *exps;
+
+			winstate->defineVariableList =
+				lappend(winstate->defineVariableList,
+						makeString(pstrdup(name)));
+			exps = ExecInitExpr(expr, (PlanState *) winstate);
+			winstate->defineClauseList =
+				lappend(winstate->defineClauseList, exps);
+		}
+	}
+
+	/* Initialize NFA free lists for row pattern matching */
+	winstate->nfaContext = NULL;
+	winstate->nfaContextTail = NULL;
+	winstate->nfaContextFree = NULL;
+	winstate->nfaStateFree = NULL;
+	winstate->nfaLastProcessedRow = -1;
+	winstate->nfaStatesActive = 0;
+	winstate->nfaContextsActive = 0;
+
+	/*
+	 * Allocate varMatched array for NFA evaluation. With the new varNames
+	 * ordering (DEFINE order first), varId == defineIdx for all defined
+	 * variables, so no mapping is needed.
+	 */
+	if (list_length(winstate->defineVariableList) > 0)
+		winstate->nfaVarMatched = palloc0(sizeof(bool) *
+										  list_length(winstate->defineVariableList));
+	else
+		winstate->nfaVarMatched = NULL;
 	winstate->all_first = true;
 	winstate->partition_spooled = false;
 	winstate->more_partitions = false;
@@ -2853,6 +3116,42 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 
 	return winstate;
 }
+
+/*
+ * ExecRPRNavGetSlot
+ *
+ * Fetch tuple at given position for RPR navigation opcodes.
+ * Returns nav_slot with the tuple loaded, or nav_null_slot if out of range.
+ */
+TupleTableSlot *
+ExecRPRNavGetSlot(WindowAggState *winstate, int64 pos)
+{
+	WindowObject winobj = winstate->nav_winobj;
+	TupleTableSlot *slot = winstate->nav_slot;
+
+	if (pos < 0)
+		return winstate->nav_null_slot;
+
+	/*
+	 * If nav_slot already holds this position, return it without re-fetching.
+	 * This is critical when multiple PREV/NEXT calls in the same expression
+	 * navigate to the same row, because re-fetching would free the slot's
+	 * tuple memory and invalidate any pass-by-ref Datum pointers from earlier
+	 * navigation results.
+	 */
+	if (winstate->nav_slot_pos == pos)
+		return slot;
+
+	if (!window_gettupleslot(winobj, pos, slot))
+	{
+		winstate->nav_slot_pos = -1;
+		return winstate->nav_null_slot;
+	}
+
+	winstate->nav_slot_pos = pos;
+	return slot;
+}
+
 
 /* -----------------
  * ExecEndWindowAgg
@@ -2911,6 +3210,8 @@ ExecReScanWindowAgg(WindowAggState *node)
 	ExecClearTuple(node->agg_row_slot);
 	ExecClearTuple(node->temp_slot_1);
 	ExecClearTuple(node->temp_slot_2);
+	if (node->nav_slot)
+		ExecClearTuple(node->nav_slot);
 	if (node->framehead_slot)
 		ExecClearTuple(node->framehead_slot);
 	if (node->frametail_slot)
@@ -3271,7 +3572,8 @@ window_gettupleslot(WindowObject winobj, int64 pos, TupleTableSlot *slot)
 		return false;
 
 	if (pos < winobj->markpos)
-		elog(ERROR, "cannot fetch row before WindowObject's mark position");
+		elog(ERROR, "cannot fetch row: " INT64_FORMAT " before WindowObject's mark position: " INT64_FORMAT,
+			 pos, winobj->markpos);
 
 	oldcontext = MemoryContextSwitchTo(winstate->ss.ps.ps_ExprContext->ecxt_per_query_memory);
 
@@ -3389,6 +3691,7 @@ ignorenulls_getfuncarginframe(WindowObject winobj, int argno,
 	int			notnull_offset;
 	int			notnull_relpos;
 	int			forward;
+	int64		num_reduced_frame;
 
 	Assert(WindowObjectIsValid(winobj));
 	winstate = winobj->winstate;
@@ -3417,6 +3720,13 @@ ignorenulls_getfuncarginframe(WindowObject winobj, int argno,
 			/* rejecting relpos > 0 is easy and simplifies code below */
 			if (relpos > 0)
 				goto out_of_frame;
+
+			/*
+			 * RPR cares about frame head pos. Need to call
+			 * update_frameheadpos
+			 */
+			update_frameheadpos(winstate);
+
 			update_frametailpos(winstate);
 			abs_pos = winstate->frametailpos - 1;
 			mark_pos = 0;		/* keep compiler quiet */
@@ -3432,6 +3742,35 @@ ignorenulls_getfuncarginframe(WindowObject winobj, int argno,
 	 * Get the next nonnull value in the frame, moving forward or backward
 	 * until we find a value or reach the frame's end.
 	 */
+
+	/*
+	 * Check whether current row is in reduced frame.
+	 */
+	num_reduced_frame = row_is_in_reduced_frame(winobj, winstate->frameheadpos);
+	if (num_reduced_frame < 0)	/* unmatched or skipped row */
+		goto out_of_frame;
+	else if (num_reduced_frame > 0) /* the first row of the reduced frame */
+	{
+		/*
+		 * Early check if row could be out of reduced frame.  When RPR is
+		 * enabled, EXCLUDE clause cannot be specified and the frame is always
+		 * contiguous.  So we can safely perform the following checks. Note,
+		 * however, it is possible that a row is out of reduced frame if
+		 * there's a NULL in the middle. So we need to check it in the
+		 * following do loop.
+		 */
+		if (seektype == WINDOW_SEEK_HEAD && relpos >= num_reduced_frame)
+			goto out_of_frame;
+		if (seektype == WINDOW_SEEK_TAIL)
+		{
+			if (notnull_relpos >= num_reduced_frame)
+				goto out_of_frame;
+
+			/* not out of reduced frame. Set abspos as a starting point */
+			abs_pos = winstate->frameheadpos + num_reduced_frame - 1;
+		}
+	}
+
 	do
 	{
 		int			inframe;
@@ -3493,6 +3832,16 @@ ignorenulls_getfuncarginframe(WindowObject winobj, int argno,
 		}
 advance:
 		abs_pos += forward;
+		if (rpr_is_defined(winstate))
+		{
+			/*
+			 * Check whether we are still in the reduced frame.  (also check
+			 * if we succeeded in getting the target row).
+			 */
+			num_reduced_frame--;
+			if (num_reduced_frame <= 0 && notnull_offset <= notnull_relpos)
+				goto out_of_frame;
+		}
 	} while (notnull_offset <= notnull_relpos);
 
 	if (set_mark)
@@ -3634,6 +3983,631 @@ put_notnull_info(WindowObject winobj, int64 pos, int argno, bool isnull)
 	mb |= (val << shift);		/* update map */
 	mbp[bpos] = mb;
 }
+
+/*
+ * eval_nav_offset_helper
+ *		Evaluate an offset expression at executor init time for trim
+ *		optimization.  Returns the offset value, or 0 for NULL/negative
+ *		(these will cause a runtime error during actual navigation, so the
+ *		trim value is irrelevant).
+ */
+static int64
+eval_nav_offset_helper(WindowAggState *winstate, Expr *offset_expr,
+					   int64 defaultOffset)
+{
+	ExprContext *econtext = winstate->ss.ps.ps_ExprContext;
+	ExprState  *estate;
+	Datum		val;
+	bool		isnull;
+	int64		offset;
+
+	if (offset_expr == NULL)
+		return defaultOffset;
+
+	estate = ExecInitExpr(offset_expr, (PlanState *) winstate);
+	val = ExecEvalExprSwitchContext(estate, econtext, &isnull);
+
+	if (isnull)
+		return 0;
+
+	offset = DatumGetInt64(val);
+	if (offset < 0)
+		return 0;
+
+	return offset;
+}
+
+typedef struct
+{
+	WindowAggState *winstate;
+	int64		maxOffset;
+	bool		overflow;		/* true if overflow detected */
+} EvalNavMaxContext;
+
+/*
+ * eval_nav_max_offset_walker
+ *		Walk expression tree evaluating backward-reach offsets at runtime.
+ *
+ * Handles simple PREV, LAST-with-offset, and compound PREV_LAST/NEXT_LAST.
+ */
+static bool
+eval_nav_max_offset_walker(Node *node, void *ctx)
+{
+	EvalNavMaxContext *context = (EvalNavMaxContext *) ctx;
+
+	if (node == NULL)
+		return false;
+
+	/* Short-circuit if overflow already detected */
+	if (context->overflow)
+		return false;
+
+	if (IsA(node, RPRNavExpr))
+	{
+		RPRNavExpr *nav = (RPRNavExpr *) node;
+		int64		reach = 0;
+
+		if (nav->kind == RPR_NAV_PREV)
+		{
+			reach = eval_nav_offset_helper(context->winstate,
+										   nav->offset_arg, 1);
+		}
+		else if (nav->kind == RPR_NAV_LAST && nav->offset_arg != NULL)
+		{
+			reach = eval_nav_offset_helper(context->winstate,
+										   nav->offset_arg, 0);
+		}
+		else if (nav->kind == RPR_NAV_PREV_LAST ||
+				 nav->kind == RPR_NAV_NEXT_LAST)
+		{
+			int64		inner = eval_nav_offset_helper(context->winstate,
+													   nav->offset_arg, 0);
+			int64		outer = eval_nav_offset_helper(context->winstate,
+													   nav->compound_offset_arg, 1);
+
+			if (nav->kind == RPR_NAV_PREV_LAST)
+			{
+				if (pg_add_s64_overflow(inner, outer, &reach))
+				{
+					context->overflow = true;
+					return false;
+				}
+			}
+			else
+				reach = (inner > outer) ? inner - outer : 0;
+		}
+
+		context->maxOffset = Max(context->maxOffset, reach);
+
+		return false;			/* don't walk into children */
+	}
+
+	return expression_tree_walker(node, eval_nav_max_offset_walker, ctx);
+}
+
+/*
+ * eval_nav_max_offset
+ *		Evaluate non-constant backward-reach offsets at executor init time.
+ *
+ * Called when the planner set navMaxOffsetKind to RPR_NAV_OFFSET_NEEDS_EVAL
+ * because some offset in PREV, LAST-with-offset, or compound PREV_LAST/
+ * NEXT_LAST contains a parameter or non-foldable expression.
+ *
+ * On overflow, sets navMaxOffsetKind to RPR_NAV_OFFSET_RETAIN_ALL so that
+ * tuplestore trim is disabled for backward navigation.
+ */
+static void
+eval_nav_max_offset(WindowAggState *winstate, List *defineClause)
+{
+	EvalNavMaxContext ctx;
+	ListCell   *lc;
+
+	ctx.winstate = winstate;
+	ctx.maxOffset = 0;
+	ctx.overflow = false;
+
+	foreach(lc, defineClause)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		eval_nav_max_offset_walker((Node *) te->expr, &ctx);
+	}
+
+	if (ctx.overflow)
+	{
+		winstate->navMaxOffsetKind = RPR_NAV_OFFSET_RETAIN_ALL;
+		winstate->navMaxOffset = 0;
+	}
+	else
+	{
+		winstate->navMaxOffsetKind = RPR_NAV_OFFSET_FIXED;
+		winstate->navMaxOffset = ctx.maxOffset;
+	}
+}
+
+typedef struct
+{
+	WindowAggState *winstate;
+	int64		minOffset;
+	bool		found;
+} EvalNavFirstContext;
+
+/*
+ * eval_nav_first_offset_walker
+ *		Walk expression tree evaluating forward-from-match_start offsets.
+ *
+ * Handles simple FIRST and compound PREV_FIRST/NEXT_FIRST.
+ */
+static bool
+eval_nav_first_offset_walker(Node *node, void *ctx)
+{
+	EvalNavFirstContext *context = (EvalNavFirstContext *) ctx;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, RPRNavExpr))
+	{
+		RPRNavExpr *nav = (RPRNavExpr *) node;
+		int64		combined = INT64_MAX;
+
+		if (nav->kind == RPR_NAV_FIRST)
+		{
+			context->found = true;
+			combined = eval_nav_offset_helper(context->winstate,
+											  nav->offset_arg, 0);
+		}
+		else if (nav->kind == RPR_NAV_PREV_FIRST ||
+				 nav->kind == RPR_NAV_NEXT_FIRST)
+		{
+			int64		inner = eval_nav_offset_helper(context->winstate,
+													   nav->offset_arg, 0);
+			int64		outer = eval_nav_offset_helper(context->winstate,
+													   nav->compound_offset_arg, 1);
+
+			context->found = true;
+			if (nav->kind == RPR_NAV_PREV_FIRST)
+			{
+				/*
+				 * combined = inner - outer.  Both are non-negative, so the
+				 * result >= -INT64_MAX, which cannot underflow int64.
+				 */
+				combined = inner - outer;
+			}
+			else
+			{
+				/*
+				 * NEXT_FIRST: combined = inner + outer.  This can overflow,
+				 * but the result is always >= 0, so it never updates
+				 * minOffset (which tracks the minimum).  Clamp to INT64_MAX
+				 * on overflow.
+				 */
+				if (pg_add_s64_overflow(inner, outer, &combined))
+					combined = INT64_MAX;
+			}
+		}
+
+		context->minOffset = Min(context->minOffset, combined);
+
+		return false;
+	}
+
+	return expression_tree_walker(node, eval_nav_first_offset_walker, ctx);
+}
+
+/*
+ * eval_nav_first_offset
+ *		Evaluate non-constant forward-from-match_start offsets at executor
+ *		init time.
+ *
+ * Called when the planner set navFirstOffsetKind to RPR_NAV_OFFSET_NEEDS_EVAL
+ * because some offset in FIRST or compound PREV_FIRST/NEXT_FIRST contains
+ * a parameter or non-foldable expression.
+ */
+static void
+eval_nav_first_offset(WindowAggState *winstate, List *defineClause)
+{
+	EvalNavFirstContext ctx;
+	ListCell   *lc;
+
+	ctx.winstate = winstate;
+	ctx.minOffset = INT64_MAX;
+	ctx.found = false;
+
+	foreach(lc, defineClause)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		eval_nav_first_offset_walker((Node *) te->expr, &ctx);
+	}
+
+	if (ctx.found && ctx.minOffset < INT64_MAX)
+	{
+		winstate->navFirstOffsetKind = RPR_NAV_OFFSET_FIXED;
+		winstate->navFirstOffset = ctx.minOffset;
+	}
+	else
+	{
+		winstate->navFirstOffsetKind = RPR_NAV_OFFSET_FIXED;
+		winstate->navFirstOffset = 0;
+	}
+}
+
+/*
+ * rpr_is_defined
+ * Return true if row pattern recognition is defined.
+ */
+static bool
+rpr_is_defined(WindowAggState *winstate)
+{
+	return winstate->rpPattern != NULL;
+}
+
+/*
+ * -----------------
+ * row_is_in_reduced_frame
+ * Determine whether a row is in the current row's reduced window frame
+ * according to row pattern matching
+ *
+ * The row must have already been determined to be in a full window frame
+ * and fetched into the slot.
+ *
+ * Returns:
+ * = 0, RPR is not defined.
+ * >0, if the row is the first in the reduced frame. Return the number of rows
+ * in the reduced frame.
+ * -1, if the row is an unmatched row
+ * -2, if the row is in the reduced frame but needed to be skipped because of
+ * AFTER MATCH SKIP PAST LAST ROW
+ * -----------------
+ */
+static int64
+row_is_in_reduced_frame(WindowObject winobj, int64 pos)
+{
+	WindowAggState *winstate = winobj->winstate;
+	int			state;
+	int64		rtn;
+
+	if (!rpr_is_defined(winstate))
+	{
+		/*
+		 * RPR is not defined. Assume that we are always in the reduced window
+		 * frame.
+		 */
+		rtn = 0;
+		return rtn;
+	}
+
+	state = get_reduced_frame_status(winstate, pos);
+
+	if (state == RF_NOT_DETERMINED)
+	{
+		update_frameheadpos(winstate);
+		update_reduced_frame(winobj, pos);
+	}
+
+	state = get_reduced_frame_status(winstate, pos);
+
+	switch (state)
+	{
+		case RF_FRAME_HEAD:
+			rtn = winstate->rpr_match_length;
+			break;
+
+		case RF_SKIPPED:
+			rtn = -2;
+			break;
+
+		case RF_UNMATCHED:
+		case RF_EMPTY_MATCH:
+			rtn = -1;
+			break;
+
+		default:
+			elog(ERROR, "unrecognized state: %d at: " INT64_FORMAT,
+				 state, pos);
+			break;
+	}
+
+	return rtn;
+}
+
+/*
+ * clear_reduced_frame
+ * Clear reduced frame status
+ */
+static void
+clear_reduced_frame(WindowAggState *winstate)
+{
+	winstate->rpr_match_valid = false;
+	winstate->rpr_match_matched = false;
+	winstate->rpr_match_start = -1;
+	winstate->rpr_match_length = 0;
+}
+
+/*
+ * get_reduced_frame_status
+ *		Look up a position against the current match.
+ *
+ * Returns one of the RF_* constants:
+ *   RF_NOT_DETERMINED  pos has not been processed yet
+ *   RF_FRAME_HEAD      pos is the start of the current match
+ *   RF_SKIPPED         pos is inside the current match but not the start
+ *   RF_UNMATCHED       pos is processed but not part of any match
+ */
+static int
+get_reduced_frame_status(WindowAggState *winstate, int64 pos)
+{
+	int64		start = winstate->rpr_match_start;
+	int64		length = winstate->rpr_match_length;
+
+	if (!winstate->rpr_match_valid)
+		return RF_NOT_DETERMINED;
+
+	/* Empty match: covers only the start position */
+	if (pos == start && winstate->rpr_match_matched && length == 0)
+		return RF_EMPTY_MATCH;
+
+	/* Outside the result range */
+	if (pos < start || pos >= start + length)
+		return RF_NOT_DETERMINED;
+
+	if (!winstate->rpr_match_matched)
+		return RF_UNMATCHED;
+
+	if (pos == start)
+		return RF_FRAME_HEAD;
+
+	return RF_SKIPPED;
+}
+
+/*
+ * update_reduced_frame
+ *		Update reduced frame info using multi-context NFA pattern matching.
+ *
+ * Maintains multiple NFA contexts simultaneously, one for each potential
+ * match start position. This allows sharing row evaluations across contexts,
+ * avoiding redundant DEFINE clause evaluations when rewinding for SKIP TO
+ * NEXT ROW mode.
+ *
+ * Key optimizations:
+ * - Row evaluations (expensive DEFINE clauses) happen only once per row
+ * - All active contexts share the same evaluation results
+ * - Contexts persist across calls, enabling O(n) DEFINE evaluations
+ */
+static void
+update_reduced_frame(WindowObject winobj, int64 pos)
+{
+	WindowAggState *winstate = winobj->winstate;
+	RPRNFAContext *targetCtx;
+	int64		currentPos;
+	int64		startPos;
+	int			frameOptions = winstate->frameOptions;
+	bool		hasLimitedFrame;
+	int64		frameOffset = 0;
+	int64		matchLen;
+
+	/*
+	 * Check if we have a limited frame (ROWS ... N FOLLOWING). Each context
+	 * needs its own frame end based on matchStartRow + offset.
+	 */
+	hasLimitedFrame = (frameOptions & FRAMEOPTION_ROWS) &&
+		!(frameOptions & FRAMEOPTION_END_UNBOUNDED_FOLLOWING);
+	if (hasLimitedFrame && winstate->endOffsetValue != 0)
+		frameOffset = DatumGetInt64(winstate->endOffsetValue);
+
+	/*
+	 * Case 1: pos is before any existing context's start position. This means
+	 * the position was already processed and determined unmatched. Head is
+	 * the oldest context (lowest matchStartRow) since contexts are added at
+	 * tail with increasing positions.
+	 */
+	if (winstate->nfaContext != NULL &&
+		pos < winstate->nfaContext->matchStartRow)
+	{
+		/* already processed, unmatched */
+		winstate->rpr_match_valid = true;
+		winstate->rpr_match_matched = false;
+		winstate->rpr_match_start = pos;
+		winstate->rpr_match_length = 1;
+		return;
+	}
+
+	/*
+	 * Case 2: Find existing context for this pos, or create new one.
+	 */
+	targetCtx = ExecRPRGetHeadContext(winstate, pos);
+	if (targetCtx == NULL)
+	{
+		/*
+		 * No context exists. If pos is already processed, it means this row
+		 * was already determined to be unmatched or skipped - no need to
+		 * reprocess.
+		 */
+		if (pos <= winstate->nfaLastProcessedRow)
+		{
+			/* already processed, unmatched */
+			winstate->rpr_match_valid = true;
+			winstate->rpr_match_matched = false;
+			winstate->rpr_match_start = pos;
+			winstate->rpr_match_length = 1;
+			return;
+		}
+		/* Not yet processed - create new context and start fresh */
+		targetCtx = ExecRPRStartContext(winstate, pos);
+	}
+	else if (targetCtx->states == NULL)
+	{
+		/* Context already completed - skip to result registration */
+		goto register_result;
+	}
+
+	/*
+	 * Determine where to start processing. Usually nfaLastProcessedRow+1 >=
+	 * pos since contexts are created at currentPos+1 during processing.
+	 * However, pos can exceed this when rows are skipped (e.g., unmatched
+	 * rows don't update nfaLastProcessedRow).
+	 */
+	startPos = Max(pos, winstate->nfaLastProcessedRow + 1);
+
+	/*
+	 * Process rows until target context completes or we hit boundaries. Each
+	 * row evaluation is shared across all active contexts.
+	 */
+	for (currentPos = startPos; targetCtx->states != NULL; currentPos++)
+	{
+		bool		rowExists;
+
+		/*
+		 * Evaluate variables for this row - done only once, shared by all
+		 * contexts.
+		 *
+		 * Set nav_match_start to the head context's matchStartRow for
+		 * FIRST/LAST navigation.  Match_start-dependent variables (FIRST,
+		 * LAST-with-offset) are re-evaluated per-context in ExecRPRProcessRow
+		 * when matchStartRow differs.
+		 */
+		winstate->nav_match_start = targetCtx->matchStartRow;
+		rowExists = nfa_evaluate_row(winobj, currentPos, winstate->nfaVarMatched);
+
+		/* No more rows in partition? Finalize all contexts */
+		if (!rowExists)
+		{
+			ExecRPRFinalizeAllContexts(winstate, currentPos - 1);
+			/* Clean up dead contexts from finalization */
+			ExecRPRCleanupDeadContexts(winstate, targetCtx);
+			break;
+		}
+
+		/* Update last processed row */
+		winstate->nfaLastProcessedRow = currentPos;
+
+		/*--------------------------
+		 * Process all contexts for this row:
+		 *   1. Match all (convergence)
+		 *   2. Absorb redundant
+		 *   3. Advance all (divergence)
+		 */
+		ExecRPRProcessRow(winstate, currentPos, hasLimitedFrame, frameOffset);
+
+		/*
+		 * Create a new context for the next potential start position. This
+		 * enables overlapping match detection for SKIP TO NEXT ROW.
+		 */
+		ExecRPRStartContext(winstate, currentPos + 1);
+
+		/*
+		 * Clean up dead contexts (failed with no active states and no match).
+		 * This removes contexts that failed during processing and counts them
+		 * appropriately as pruned or mismatched.
+		 */
+		ExecRPRCleanupDeadContexts(winstate, targetCtx);
+	}
+
+register_result:
+	Assert(pos == targetCtx->matchStartRow);
+
+	/*
+	 * Record match result.
+	 */
+	winstate->rpr_match_valid = true;
+	winstate->rpr_match_start = targetCtx->matchStartRow;
+
+	if (targetCtx->matchEndRow < targetCtx->matchStartRow)
+	{
+		matchLen = targetCtx->lastProcessedRow - targetCtx->matchStartRow + 1;
+
+		if (targetCtx->matchedState != NULL)
+		{
+			/* Empty match: FIN reached but 0 rows consumed */
+			winstate->rpr_match_matched = true;
+			winstate->rpr_match_length = 0;
+			ExecRPRRecordContextSuccess(winstate, 0);
+		}
+		else
+		{
+			/* No match */
+			winstate->rpr_match_matched = false;
+			winstate->rpr_match_length = 1;
+			ExecRPRRecordContextFailure(winstate, matchLen);
+		}
+		ExecRPRFreeContext(winstate, targetCtx);
+		return;
+	}
+
+	/* Match succeeded */
+	matchLen = targetCtx->matchEndRow - targetCtx->matchStartRow + 1;
+
+	winstate->rpr_match_matched = true;
+	winstate->rpr_match_length = matchLen;
+	ExecRPRRecordContextSuccess(winstate, matchLen);
+
+	/* Remove the matched context */
+	ExecRPRFreeContext(winstate, targetCtx);
+}
+
+/*
+ * nfa_evaluate_row
+ *
+ * Evaluate all DEFINE variables for current row.
+ * Returns true if the row exists, false if out of partition.
+ * If row exists, fills varMatched array.
+ * varMatched[i] = true if variable i matched at current row.
+ *
+ * Uses 1-slot model: only ecxt_outertuple is set to the current row.
+ * PREV/NEXT/FIRST/LAST navigation is handled by EEOP_RPR_NAV_SET/RESTORE
+ * opcodes during expression evaluation, which temporarily swap the slot.
+ */
+static bool
+nfa_evaluate_row(WindowObject winobj, int64 pos, bool *varMatched)
+{
+	WindowAggState *winstate = winobj->winstate;
+	ExprContext *econtext = winstate->ss.ps.ps_ExprContext;
+	int			numDefineVars = list_length(winstate->defineVariableList);
+	ListCell   *lc;
+	int			varIdx = 0;
+	TupleTableSlot *slot;
+	int64		saved_pos;
+
+	/* Fetch current row into temp_slot_1 */
+	slot = winstate->temp_slot_1;
+	if (!window_gettupleslot(winobj, pos, slot))
+		return false;			/* No row exists */
+
+	/* Set up 1-slot context: only ecxt_outertuple */
+	econtext->ecxt_outertuple = slot;
+
+	/*
+	 * Save and set currentpos so that EEOP_RPR_NAV_SET opcodes can calculate
+	 * target positions (currentpos +/- offset).
+	 */
+	saved_pos = winstate->currentpos;
+	winstate->currentpos = pos;
+
+	/* Invalidate nav_slot cache so PREV/NEXT re-fetch for new row */
+	winstate->nav_slot_pos = -1;
+
+	foreach(lc, winstate->defineClauseList)
+	{
+		ExprState  *exprState = (ExprState *) lfirst(lc);
+		Datum		result;
+		bool		isnull;
+
+		/* Evaluate DEFINE expression */
+		result = ExecEvalExpr(exprState, econtext, &isnull);
+
+		varMatched[varIdx] = (!isnull && DatumGetBool(result));
+
+		varIdx++;
+		if (varIdx >= numDefineVars)
+			break;
+	}
+
+	winstate->currentpos = saved_pos;
+
+	return true;				/* Row exists */
+}
+
 
 /***********************************************************************
  * API exposed to window functions
@@ -4001,8 +4975,6 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 	WindowAggState *winstate;
 	ExprContext *econtext;
 	TupleTableSlot *slot;
-	int64		abs_pos;
-	int64		mark_pos;
 
 	Assert(WindowObjectIsValid(winobj));
 	winstate = winobj->winstate;
@@ -4012,6 +4984,48 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 	if (winobj->ignore_nulls == IGNORE_NULLS)
 		return ignorenulls_getfuncarginframe(winobj, argno, relpos, seektype,
 											 set_mark, isnull, isout);
+
+	if (WinGetSlotInFrame(winobj, slot,
+						  relpos, seektype, set_mark,
+						  isnull, isout) == 0)
+	{
+		econtext->ecxt_outertuple = slot;
+		return ExecEvalExpr((ExprState *) list_nth(winobj->argstates, argno),
+							econtext, isnull);
+	}
+
+	if (isout)
+		*isout = true;
+	*isnull = true;
+	return (Datum) 0;
+}
+
+/*
+ * WinGetSlotInFrame
+ * slot: TupleTableSlot to store the result
+ * relpos: signed rowcount offset from the seek position
+ * seektype: WINDOW_SEEK_HEAD or WINDOW_SEEK_TAIL
+ * set_mark: If the row is found/in frame and set_mark is true, the mark is
+ *		moved to the row as a side-effect.
+ * isnull: output argument, receives isnull status of result
+ * isout: output argument, set to indicate whether target row position
+ *		is out of frame (can pass NULL if caller doesn't care about this)
+ *
+ * Returns 0 if we successfully got the slot, or nonzero if out of frame.
+ * (isout is also set in the latter case.)
+ */
+static int
+WinGetSlotInFrame(WindowObject winobj, TupleTableSlot *slot,
+				  int relpos, int seektype, bool set_mark,
+				  bool *isnull, bool *isout)
+{
+	WindowAggState *winstate;
+	int64		abs_pos;
+	int64		mark_pos;
+	int64		num_reduced_frame;
+
+	Assert(WindowObjectIsValid(winobj));
+	winstate = winobj->winstate;
 
 	switch (seektype)
 	{
@@ -4079,11 +5093,25 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 						 winstate->frameOptions);
 					break;
 			}
+			num_reduced_frame = row_is_in_reduced_frame(winobj,
+														winstate->frameheadpos);
+			if (num_reduced_frame < 0)
+				goto out_of_frame;
+			else if (num_reduced_frame > 0)
+				if (relpos >= num_reduced_frame)
+					goto out_of_frame;
 			break;
 		case WINDOW_SEEK_TAIL:
 			/* rejecting relpos > 0 is easy and simplifies code below */
 			if (relpos > 0)
 				goto out_of_frame;
+
+			/*
+			 * RPR cares about frame head pos. Need to call
+			 * update_frameheadpos
+			 */
+			update_frameheadpos(winstate);
+
 			update_frametailpos(winstate);
 			abs_pos = winstate->frametailpos - 1 + relpos;
 
@@ -4150,6 +5178,18 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 					mark_pos = 0;	/* keep compiler quiet */
 					break;
 			}
+
+			num_reduced_frame = row_is_in_reduced_frame(winobj,
+														winstate->frameheadpos);
+			if (num_reduced_frame < 0)
+				goto out_of_frame;
+			else if (num_reduced_frame > 0)
+			{
+				if (-relpos >= num_reduced_frame)
+					goto out_of_frame;
+				abs_pos = winstate->frameheadpos + relpos +
+					num_reduced_frame - 1;
+			}
 			break;
 		default:
 			elog(ERROR, "unrecognized window seek type: %d", seektype);
@@ -4167,16 +5207,24 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 	if (isout)
 		*isout = false;
 	if (set_mark)
+	{
+		/*
+		 * If RPR is enabled and seek type is WINDOW_SEEK_TAIL, we set the
+		 * mark position unconditionally to frameheadpos. In this case the
+		 * frame always starts at CURRENT_ROW and never goes back, thus
+		 * setting the mark at the position is safe.
+		 */
+		if (winstate->rpPattern != NULL && seektype == WINDOW_SEEK_TAIL)
+			mark_pos = winstate->frameheadpos;
 		WinSetMarkPosition(winobj, mark_pos);
-	econtext->ecxt_outertuple = slot;
-	return ExecEvalExpr((ExprState *) list_nth(winobj->argstates, argno),
-						econtext, isnull);
+	}
+	return 0;
 
 out_of_frame:
 	if (isout)
 		*isout = true;
 	*isnull = true;
-	return (Datum) 0;
+	return -1;
 }
 
 /*

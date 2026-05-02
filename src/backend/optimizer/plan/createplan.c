@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 
+#include "common/int.h"
 #include "access/sysattr.h"
 #include "access/transam.h"
 #include "catalog/pg_class.h"
@@ -36,6 +37,7 @@
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/subselect.h"
+#include "optimizer/rpr.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
@@ -288,7 +290,11 @@ static Memoize *make_memoize(Plan *lefttree, Oid *hashoperators,
 static WindowAgg *make_windowagg(List *tlist, WindowClause *wc,
 								 int partNumCols, AttrNumber *partColIdx, Oid *partOperators, Oid *partCollations,
 								 int ordNumCols, AttrNumber *ordColIdx, Oid *ordOperators, Oid *ordCollations,
-								 List *runCondition, List *qual, bool topWindow,
+								 List *runCondition, RPSkipTo rpSkipTo,
+								 RPRPattern *compiledPattern,
+								 List *defineClause,
+								 Bitmapset *defineMatchStartDependent,
+								 List *qual, bool topWindow,
 								 Plan *lefttree);
 static Group *make_group(List *tlist, List *qual, int numGroupCols,
 						 AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
@@ -2458,6 +2464,363 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 }
 
 /*
+ * NavOffsetContext - context for compute_nav_offsets walker.
+ *
+ * Collects both backward reach (PREV, LAST-with-offset, compound
+ * PREV_LAST/NEXT_LAST) and forward-from-match-start reach (FIRST,
+ * compound PREV_FIRST/NEXT_FIRST) in a single tree walk.
+ */
+typedef struct NavOffsetContext
+{
+	int64		maxOffset;		/* max PREV/LAST backward offset (>= 0) */
+	bool		maxNeedsEval;	/* non-constant PREV/LAST offset found */
+	bool		maxOverflow;	/* constant offset overflow detected */
+	int64		firstOffset;	/* min FIRST offset (may be negative for
+								 * PREV_FIRST) */
+	bool		hasFirst;		/* any FIRST node found */
+	bool		firstNeedsEval; /* non-constant FIRST offset found */
+} NavOffsetContext;
+
+/*
+ * Helper: extract constant offset from an expression, handling NULL/negative.
+ * If expr is NULL, returns defaultOffset.
+ * Returns true if constant, false if non-constant (Param, cast, etc.).
+ */
+static bool
+extract_const_offset(Expr *expr, int64 defaultOffset, int64 *result)
+{
+	if (expr == NULL)
+	{
+		*result = defaultOffset;
+		return true;
+	}
+
+	if (IsA(expr, Const))
+	{
+		Const	   *c = (Const *) expr;
+
+		if (c->constisnull)
+			*result = 0;		/* runtime error; safe placeholder */
+		else
+		{
+			*result = DatumGetInt64(c->constvalue);
+			if (*result < 0)
+				*result = 0;	/* runtime error; safe placeholder */
+		}
+		return true;
+	}
+
+	return false;				/* non-constant */
+}
+
+/*
+ * nav_offset_walker
+ *		Expression tree walker for compute_nav_offsets.
+ *
+ * For each RPRNavExpr found, extract its constant offset(s) and update the
+ * NavOffsetContext with the maximum backward reach (maxOffset) and minimum
+ * forward reach (firstOffset).  Handles simple navigation (PREV, NEXT,
+ * FIRST, LAST) and compound forms (PREV_FIRST, NEXT_FIRST, PREV_LAST,
+ * NEXT_LAST) by combining inner and outer offsets.
+ *
+ * Non-constant offsets set maxNeedsEval or firstNeedsEval.  Overflow sets
+ * maxOverflow or firstOverflow for RETAIN_ALL fallback.
+ */
+static bool
+nav_offset_walker(Node *node, void *ctx)
+{
+	NavOffsetContext *context = (NavOffsetContext *) ctx;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, RPRNavExpr))
+	{
+		RPRNavExpr *nav = (RPRNavExpr *) node;
+
+		/*
+		 * Simple PREV(v, N) and LAST(v, N): backward reach from currentpos.
+		 * LAST without offset = currentpos, no backward reach. NEXT: forward
+		 * only, irrelevant for trim.
+		 */
+		if (nav->kind == RPR_NAV_PREV ||
+			(nav->kind == RPR_NAV_LAST && nav->offset_arg != NULL))
+		{
+			if (!context->maxNeedsEval)
+			{
+				int64		offset;
+
+				if (extract_const_offset(nav->offset_arg, 1, &offset))
+					context->maxOffset = Max(context->maxOffset, offset);
+				else
+					context->maxNeedsEval = true;
+			}
+		}
+
+		/*
+		 * Simple FIRST(v, N): forward reach from match_start. Smaller N means
+		 * older rows needed.
+		 */
+		if (nav->kind == RPR_NAV_FIRST)
+		{
+			context->hasFirst = true;
+
+			if (!context->firstNeedsEval)
+			{
+				int64		offset;
+
+				if (extract_const_offset(nav->offset_arg, 0, &offset))
+					context->firstOffset = Min(context->firstOffset, offset);
+				else
+					context->firstNeedsEval = true;
+			}
+		}
+
+		/*
+		 * Compound PREV_LAST / NEXT_LAST: base = currentpos. PREV_LAST(v, N,
+		 * M): target = currentpos - N - M -> lookback = N + M NEXT_LAST(v, N,
+		 * M): target = currentpos - N + M -> lookback = max(N - M, 0)
+		 */
+		if (nav->kind == RPR_NAV_PREV_LAST ||
+			nav->kind == RPR_NAV_NEXT_LAST)
+		{
+			if (!context->maxNeedsEval)
+			{
+				int64		inner,
+							outer,
+							combined;
+
+				if (extract_const_offset(nav->offset_arg, 0, &inner) &&
+					extract_const_offset(nav->compound_offset_arg, 1, &outer))
+				{
+					if (nav->kind == RPR_NAV_PREV_LAST)
+					{
+						if (pg_add_s64_overflow(inner, outer, &combined))
+						{
+							context->maxOverflow = true;
+							return false;
+						}
+					}
+					else
+						combined = (inner > outer) ? inner - outer : 0;
+
+					context->maxOffset = Max(context->maxOffset, combined);
+				}
+				else
+					context->maxNeedsEval = true;
+			}
+		}
+
+		/*
+		 * Compound PREV_FIRST / NEXT_FIRST: base = match_start. PREV_FIRST(v,
+		 * N, M): target = match_start + N - M NEXT_FIRST(v, N, M): target =
+		 * match_start + N + M The combined offset (N+/-M) from match_start
+		 * can be negative, meaning rows before match_start are needed.
+		 */
+		if (nav->kind == RPR_NAV_PREV_FIRST ||
+			nav->kind == RPR_NAV_NEXT_FIRST)
+		{
+			context->hasFirst = true;
+
+			if (!context->firstNeedsEval)
+			{
+				int64		inner,
+							outer,
+							combined;
+
+				if (extract_const_offset(nav->offset_arg, 0, &inner) &&
+					extract_const_offset(nav->compound_offset_arg, 1, &outer))
+				{
+					if (nav->kind == RPR_NAV_PREV_FIRST)
+					{
+						/*
+						 * combined = inner - outer.  Both are non-negative,
+						 * so the result >= -INT64_MAX, which cannot underflow
+						 * int64.  No overflow check needed.
+						 */
+						combined = inner - outer;
+					}
+					else
+					{
+						/*
+						 * NEXT_FIRST: combined = inner + outer.  This can
+						 * overflow, but the result is always >= 0, so it
+						 * never updates firstOffset (which tracks the
+						 * minimum).  Clamp to INT64_MAX on overflow.
+						 */
+						if (pg_add_s64_overflow(inner, outer, &combined))
+							combined = INT64_MAX;
+					}
+
+					context->firstOffset = Min(context->firstOffset, combined);
+				}
+				else
+					context->firstNeedsEval = true;
+			}
+		}
+
+		/* Don't walk into RPRNavExpr children */
+		return false;
+	}
+
+	return expression_tree_walker(node, nav_offset_walker, ctx);
+}
+
+/*
+ * compute_nav_offsets
+ *		Compute navigation offsets for tuplestore trim in a single pass.
+ *
+ * Walks all DEFINE clause expressions once, computing:
+ *   - maxOffset: max backward reach from PREV, LAST-with-offset,
+ *     compound PREV_LAST/NEXT_LAST
+ *   - hasFirst/firstOffset: min forward-from-match-start reach from
+ *     FIRST, compound PREV_FIRST/NEXT_FIRST
+ */
+static void
+compute_nav_offsets(List *defineClause,
+					RPRNavOffsetKind *maxKind, int64 *maxResult,
+					bool *hasFirst,
+					RPRNavOffsetKind *firstKind, int64 *firstResult)
+{
+	NavOffsetContext ctx;
+	ListCell   *lc;
+
+	ctx.maxOffset = 0;
+	ctx.maxNeedsEval = false;
+	ctx.maxOverflow = false;
+	ctx.firstOffset = INT64_MAX;	/* sentinel: no FIRST found yet */
+	ctx.hasFirst = false;
+	ctx.firstNeedsEval = false;
+
+	foreach(lc, defineClause)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		nav_offset_walker((Node *) te->expr, &ctx);
+	}
+
+	/* Max backward offset */
+	if (ctx.maxOverflow)
+	{
+		*maxKind = RPR_NAV_OFFSET_RETAIN_ALL;
+		*maxResult = 0;
+	}
+	else if (ctx.maxNeedsEval)
+	{
+		*maxKind = RPR_NAV_OFFSET_NEEDS_EVAL;
+		*maxResult = 0;
+	}
+	else
+	{
+		*maxKind = RPR_NAV_OFFSET_FIXED;
+		*maxResult = ctx.maxOffset;
+	}
+
+	/* First offset (can be negative for compound PREV_FIRST) */
+	*hasFirst = ctx.hasFirst;
+	if (ctx.hasFirst)
+	{
+		if (ctx.firstNeedsEval)
+		{
+			*firstKind = RPR_NAV_OFFSET_NEEDS_EVAL;
+			*firstResult = 0;
+		}
+		else if (ctx.firstOffset == INT64_MAX)
+		{
+			*firstKind = RPR_NAV_OFFSET_FIXED;
+			*firstResult = 0;	/* only implicit FIRST(v) */
+		}
+		else
+		{
+			*firstKind = RPR_NAV_OFFSET_FIXED;
+			*firstResult = ctx.firstOffset; /* may be negative */
+		}
+	}
+	else
+	{
+		*firstKind = RPR_NAV_OFFSET_FIXED;
+		*firstResult = 0;
+	}
+}
+
+/*
+ * has_match_start_dependency
+ *		Check if an expression tree contains navigation that depends on
+ *		match_start: FIRST, LAST-with-offset, or compound PREV_FIRST/
+ *		NEXT_FIRST/PREV_LAST/NEXT_LAST with offset.  Such expressions
+ *		require per-context re-evaluation during NFA processing.
+ *
+ * LAST without offset always resolves to currentpos and is
+ * match_start-independent.
+ */
+static bool
+has_match_start_dependency(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, RPRNavExpr))
+	{
+		RPRNavExpr *nav = (RPRNavExpr *) node;
+
+		if (nav->kind == RPR_NAV_FIRST)
+			return true;
+		if (nav->kind == RPR_NAV_LAST && nav->offset_arg != NULL)
+			return true;
+
+		/* Compound kinds with FIRST base depend on match_start */
+		if (nav->kind == RPR_NAV_PREV_FIRST ||
+			nav->kind == RPR_NAV_NEXT_FIRST)
+			return true;
+
+		/*
+		 * PREV_LAST/NEXT_LAST: inner is LAST, which uses currentpos.
+		 * match_start-dependent only if inner has offset (clamped to
+		 * match_start).
+		 */
+		if ((nav->kind == RPR_NAV_PREV_LAST ||
+			 nav->kind == RPR_NAV_NEXT_LAST) &&
+			nav->offset_arg != NULL)
+			return true;
+
+		/* Check children (arg may contain further nav expressions) */
+		return has_match_start_dependency((Node *) nav->arg, context);
+	}
+
+	return expression_tree_walker(node, has_match_start_dependency, NULL);
+}
+
+/*
+ * compute_match_start_dependent
+ *		Build a Bitmapset of DEFINE variable indices whose expressions
+ *		depend on match_start (contain FIRST, LAST-with-offset, or
+ *		compound PREV_FIRST/NEXT_FIRST/PREV_LAST/NEXT_LAST with offset).
+ *
+ * Variables in this set require per-context re-evaluation during NFA
+ * processing, because different contexts may have different match_start
+ * values.
+ */
+static Bitmapset *
+compute_match_start_dependent(List *defineClause)
+{
+	Bitmapset  *result = NULL;
+	ListCell   *lc;
+	int			varIdx = 0;
+
+	foreach(lc, defineClause)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (has_match_start_dependency((Node *) te->expr, NULL))
+			result = bms_add_member(result, varIdx);
+
+		varIdx++;
+	}
+
+	return result;
+}
+
+/*
  * create_windowagg_plan
  *
  *	  Create a WindowAgg plan for 'best_path' and (recursively) plans
@@ -2481,6 +2844,11 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 	Oid		   *ordOperators;
 	Oid		   *ordCollations;
 	ListCell   *lc;
+	List	   *defineVariableList = NIL;
+	List	   *filteredDefineClause = NIL;
+	RPRPattern *compiledPattern = NULL;
+	Bitmapset  *matchStartDependent = NULL;
+
 
 	/*
 	 * Choice of tlist here is motivated by the fact that WindowAgg will be
@@ -2531,6 +2899,28 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 		ordNumCols++;
 	}
 
+	/* Build RPR pattern and defineVariableList */
+	if (wc->rpPattern)
+	{
+		/*
+		 * Build defineVariableList from defineClause.  The parser already
+		 * rejects DEFINE variables not used in PATTERN, so no filtering is
+		 * needed.
+		 */
+		buildDefineVariableList(wc->defineClause, &defineVariableList);
+		filteredDefineClause = wc->defineClause;
+
+		/* Identify match_start-dependent DEFINE variables */
+		matchStartDependent = compute_match_start_dependent(wc->defineClause);
+
+		/* Compile and optimize RPR patterns */
+		compiledPattern = buildRPRPattern(wc->rpPattern,
+										  defineVariableList,
+										  wc->rpSkipTo,
+										  wc->frameOptions,
+										  !bms_is_empty(matchStartDependent));
+	}
+
 	/* And finally we can make the WindowAgg node */
 	plan = make_windowagg(tlist,
 						  wc,
@@ -2543,6 +2933,10 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 						  ordOperators,
 						  ordCollations,
 						  best_path->runCondition,
+						  wc->rpSkipTo,
+						  compiledPattern,
+						  filteredDefineClause,
+						  matchStartDependent,
 						  best_path->qual,
 						  best_path->topwindow,
 						  subplan);
@@ -6613,7 +7007,11 @@ static WindowAgg *
 make_windowagg(List *tlist, WindowClause *wc,
 			   int partNumCols, AttrNumber *partColIdx, Oid *partOperators, Oid *partCollations,
 			   int ordNumCols, AttrNumber *ordColIdx, Oid *ordOperators, Oid *ordCollations,
-			   List *runCondition, List *qual, bool topWindow, Plan *lefttree)
+			   List *runCondition, RPSkipTo rpSkipTo,
+			   RPRPattern *compiledPattern,
+			   List *defineClause,
+			   Bitmapset *defineMatchStartDependent,
+			   List *qual, bool topWindow, Plan *lefttree)
 {
 	WindowAgg  *node = makeNode(WindowAgg);
 	Plan	   *plan = &node->plan;
@@ -6640,6 +7038,21 @@ make_windowagg(List *tlist, WindowClause *wc,
 	node->inRangeAsc = wc->inRangeAsc;
 	node->inRangeNullsFirst = wc->inRangeNullsFirst;
 	node->topWindow = topWindow;
+	node->rpSkipTo = rpSkipTo;
+
+	/* Store compiled pattern for NFA execution */
+	node->rpPattern = compiledPattern;
+
+	node->defineClause = defineClause;
+
+	/* Store pre-computed match_start dependency bitmapset */
+	node->defineMatchStartDependent = defineMatchStartDependent;
+
+	/* Compute nav offsets for tuplestore trim optimization */
+	compute_nav_offsets(defineClause,
+						&node->navMaxOffsetKind, &node->navMaxOffset,
+						&node->hasFirstNav,
+						&node->navFirstOffsetKind, &node->navFirstOffset);
 
 	plan->targetlist = tlist;
 	plan->lefttree = lefttree;

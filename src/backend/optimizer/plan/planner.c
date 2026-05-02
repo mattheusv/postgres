@@ -1053,6 +1053,9 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 												EXPRKIND_LIMIT);
 		wc->endOffset = preprocess_expression(root, wc->endOffset,
 											  EXPRKIND_LIMIT);
+		wc->defineClause = (List *) preprocess_expression(root,
+														  (Node *) wc->defineClause,
+														  EXPRKIND_TARGET);
 	}
 
 	parse->limitOffset = preprocess_expression(root, parse->limitOffset,
@@ -6166,6 +6169,14 @@ optimize_window_clauses(PlannerInfo *root, WindowFuncLists *wflists)
 		if (wflists->windowFuncs[wc->winref] == NIL)
 			continue;
 
+		/*
+		 * If a DEFINE clause exists, do not let support functions replace the
+		 * frame with a non-RPR-compatible one.  RPR windows require ROWS
+		 * BETWEEN CURRENT ROW AND ...
+		 */
+		if (wc->defineClause != NIL)
+			continue;
+
 		foreach(lc2, wflists->windowFuncs[wc->winref])
 		{
 			SupportRequestOptimizeWindowClause req;
@@ -6249,7 +6260,11 @@ optimize_window_clauses(PlannerInfo *root, WindowFuncLists *wflists)
 					equal(wc->orderClause, existing_wc->orderClause) &&
 					wc->frameOptions == existing_wc->frameOptions &&
 					equal(wc->startOffset, existing_wc->startOffset) &&
-					equal(wc->endOffset, existing_wc->endOffset))
+					equal(wc->endOffset, existing_wc->endOffset) &&
+					wc->rpSkipTo == existing_wc->rpSkipTo &&
+					wc->initial == existing_wc->initial &&
+					equal(wc->defineClause, existing_wc->defineClause) &&
+					equal(wc->rpPattern, existing_wc->rpPattern))
 				{
 					ListCell   *lc4;
 

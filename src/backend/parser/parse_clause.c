@@ -39,6 +39,7 @@
 #include "parser/parse_graphtable.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_rpr.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
@@ -88,8 +89,6 @@ static void checkExprIsVarFree(ParseState *pstate, Node *n,
 							   const char *constructName);
 static TargetEntry *findTargetlistEntrySQL92(ParseState *pstate, Node *node,
 											 List **tlist, ParseExprKind exprKind);
-static TargetEntry *findTargetlistEntrySQL99(ParseState *pstate, Node *node,
-											 List **tlist, ParseExprKind exprKind);
 static int	get_matching_location(int sortgroupref,
 								  List *sortgrouprefs, List *exprs);
 static List *resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
@@ -100,7 +99,6 @@ static WindowClause *findWindowClause(List *wclist, const char *name);
 static Node *transformFrameOffset(ParseState *pstate, int frameOptions,
 								  Oid rangeopfamily, Oid rangeopcintype, Oid *inRangeFunc,
 								  Node *clause);
-
 
 /*
  * transformFromClause -
@@ -2312,7 +2310,7 @@ findTargetlistEntrySQL92(ParseState *pstate, Node *node, List **tlist,
  * tlist	the target list (passed by reference so we can append to it)
  * exprKind identifies clause type being processed
  */
-static TargetEntry *
+TargetEntry *
 findTargetlistEntrySQL99(ParseState *pstate, Node *node, List **tlist,
 						 ParseExprKind exprKind)
 {
@@ -3035,6 +3033,8 @@ transformWindowDefinitions(ParseState *pstate,
 		 * And prepare the new WindowClause.
 		 */
 		wc = makeNode(WindowClause);
+		wc->rpSkipTo = ST_NONE; /* ST_NONE marks this as a non-RPR window;
+								 * overridden by transformRPR() if RPR is used */
 		wc->name = windef->name;
 		wc->refname = windef->refname;
 
@@ -3163,6 +3163,10 @@ transformWindowDefinitions(ParseState *pstate,
 											 rangeopfamily, rangeopcintype,
 											 &wc->endInRangeFunc,
 											 windef->endOffset);
+
+		/* Process Row Pattern Recognition related clauses */
+		transformRPR(pstate, wc, windef, targetlist);
+
 		wc->winref = winref;
 
 		result = lappend(result, wc);

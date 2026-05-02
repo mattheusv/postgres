@@ -52,6 +52,9 @@ extern List *addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 extern Index assignSortGroupRef(TargetEntry *tle, List *tlist);
 extern bool targetIsInSortList(TargetEntry *tle, Oid sortop, List *sortList);
 
+extern TargetEntry *findTargetlistEntrySQL99(ParseState *pstate, Node *node,
+											 List **tlist, ParseExprKind exprKind);
+
 /* functions in parse_jsontable.c */
 extern ParseNamespaceItem *transformJsonTable(ParseState *pstate, JsonTable *jt);
 

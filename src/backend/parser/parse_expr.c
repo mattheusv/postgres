@@ -579,6 +579,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 		case EXPR_KIND_GENERATED_COLUMN:
 		case EXPR_KIND_CYCLE_MARK:
 		case EXPR_KIND_PROPGRAPH_PROPERTY:
+		case EXPR_KIND_RPR_DEFINE:
 			/* okay */
 			break;
 
@@ -626,6 +627,42 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 	node = transformGraphTablePropertyRef(pstate, cref);
 	if (node != NULL)
 		return node;
+
+	/*
+	 * Qualified column references in DEFINE are not supported.  This covers
+	 * both FROM-clause range variables (prohibited by §6.5) and pattern
+	 * variable qualified names (e.g. UP.price), which are valid per §4.16
+	 * but not yet implemented.
+	 */
+	if (pstate->p_expr_kind == EXPR_KIND_RPR_DEFINE &&
+		list_length(cref->fields) != 1)
+	{
+		char	   *qualifier = strVal(linitial(cref->fields));
+		ListCell   *lc;
+		bool		is_pattern_var = false;
+
+		foreach(lc, pstate->p_rpr_pattern_vars)
+		{
+			if (strcmp(strVal(lfirst(lc)), qualifier) == 0)
+			{
+				is_pattern_var = true;
+				break;
+			}
+		}
+
+		if (is_pattern_var)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pattern variable qualified column reference \"%s\" is not supported in DEFINE clause",
+							NameListToString(cref->fields)),
+					 parser_errposition(pstate, cref->location)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("range variable qualified column reference \"%s\" is not allowed in DEFINE clause",
+							NameListToString(cref->fields)),
+					 parser_errposition(pstate, cref->location)));
+	}
 
 	/*----------
 	 * The allowed syntaxes are:
@@ -1891,6 +1928,9 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 			break;
 		case EXPR_KIND_FOR_PORTION:
 			err = _("cannot use subquery in FOR PORTION OF expression");
+			break;
+		case EXPR_KIND_RPR_DEFINE:
+			err = _("cannot use subquery in DEFINE expression");
 			break;
 
 			/*
@@ -3255,6 +3295,8 @@ ParseExprKindName(ParseExprKind exprKind)
 			return "property definition expression";
 		case EXPR_KIND_FOR_PORTION:
 			return "FOR PORTION OF";
+		case EXPR_KIND_RPR_DEFINE:
+			return "DEFINE";
 
 			/*
 			 * There is intentionally no default: case here, so that the

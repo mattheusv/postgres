@@ -210,6 +210,8 @@ static void preprocess_pub_all_objtype_list(List *all_objects_list,
 static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+static RPRPatternNode *makeRPRQuantifier(int min, int max, ParseLoc reluctant, int location,
+									   core_yyscan_t yyscanner);
 
 %}
 
@@ -718,6 +720,15 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				label_term
 %type <str>		opt_colid
 
+%type <target>	row_pattern_definition
+%type <node>	opt_row_pattern_common_syntax
+				row_pattern row_pattern_alt row_pattern_seq
+				row_pattern_term row_pattern_primary
+				row_pattern_quantifier_opt
+%type <list>	row_pattern_definition_list
+%type <ival>	opt_row_pattern_skip_to
+%type <boolean>	opt_row_pattern_initial_or_seek
+
 /*
  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
  * They must be listed first so that their numeric codes do not depend on
@@ -760,7 +771,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
 
 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
-	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC DESTINATION
+	DEFERRABLE DEFERRED DEFINE DEFINER DELETE_P DELIMITER DELIMITERS DEPENDS DEPTH DESC DESTINATION
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
@@ -776,7 +787,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
 	IDENTITY_P IF_P IGNORE_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
-	INCLUDING INCREMENT INDENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
+	INCLUDING INCREMENT INDENT INDEX INDEXES INHERIT INHERITS INITIAL INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
 
@@ -801,8 +812,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
-	PARALLEL PARAMETER PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PATH
-	PERIOD PLACING PLAN PLANS POLICY PORTION
+	PARALLEL PARAMETER PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PAST PATH
+	PATTERN_P PERIOD PLACING PLAN PLANS POLICY PORTION
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PROPERTIES PROPERTY PUBLICATION
 
@@ -813,7 +824,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	RESET RESPECT_P RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
-	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
+	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SEEK SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPLIT SOURCE SQL_P STABLE STANDALONE_P
@@ -896,8 +907,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * reference point for a precedence level that we can assign to other
  * keywords that lack a natural precedence level.
  *
- * We need to do this for PARTITION, RANGE, ROWS, and GROUPS to support
- * opt_existing_window_name (see comment there).
+ * We need to do this for PARTITION, RANGE, ROWS, GROUPS, AFTER, INITIAL,
+ * SEEK, PATTERN_P to support opt_existing_window_name (see comment there).
  *
  * The frame_bound productions UNBOUNDED PRECEDING and UNBOUNDED FOLLOWING
  * are even messier: since UNBOUNDED is an unreserved keyword (per spec!),
@@ -930,6 +941,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %nonassoc	UNBOUNDED NESTED /* ideally would have same precedence as IDENT */
 %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
 			SET KEYS OBJECT_P SCALAR TO USING VALUE_P WITH WITHOUT PATH
+			AFTER INITIAL SEEK PATTERN_P
 %left		Op OPERATOR RIGHT_ARROW '|'	/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
@@ -17335,6 +17347,8 @@ over_clause: OVER window_specification
 					n->startOffset = NULL;
 					n->endOffset = NULL;
 					n->location = @2;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 			| /*EMPTY*/
@@ -17342,7 +17356,8 @@ over_clause: OVER window_specification
 		;
 
 window_specification: '(' opt_existing_window_name opt_partition_clause
-						opt_sort_clause opt_frame_clause ')'
+						opt_sort_clause opt_frame_clause
+						opt_row_pattern_common_syntax ')'
 				{
 					WindowDef  *n = makeNode(WindowDef);
 
@@ -17354,20 +17369,23 @@ window_specification: '(' opt_existing_window_name opt_partition_clause
 					n->frameOptions = $5->frameOptions;
 					n->startOffset = $5->startOffset;
 					n->endOffset = $5->endOffset;
+					n->frameLocation = $5->frameLocation;
+					n->excludeLocation = $5->excludeLocation;
+					n->rpCommonSyntax = (RPCommonSyntax *)$6;
 					n->location = @1;
 					$$ = n;
 				}
 		;
 
 /*
- * If we see PARTITION, RANGE, ROWS or GROUPS as the first token after the '('
- * of a window_specification, we want the assumption to be that there is
- * no existing_window_name; but those keywords are unreserved and so could
- * be ColIds.  We fix this by making them have the same precedence as IDENT
- * and giving the empty production here a slightly higher precedence, so
- * that the shift/reduce conflict is resolved in favor of reducing the rule.
- * These keywords are thus precluded from being an existing_window_name but
- * are not reserved for any other purpose.
+ * If we see PARTITION, RANGE, ROWS, GROUPS, AFTER, INITIAL, SEEK or PATTERN_P
+ * as the first token after the '(' of a window_specification, we want the
+ * assumption to be that there is no existing_window_name; but those keywords
+ * are unreserved and so could be ColIds.  We fix this by making them have the
+ * same precedence as IDENT and giving the empty production here a slightly
+ * higher precedence, so that the shift/reduce conflict is resolved in favor
+ * of reducing the rule.  These keywords are thus precluded from being an
+ * existing_window_name but are not reserved for any other purpose.
  */
 opt_existing_window_name: ColId						{ $$ = $1; }
 			| /*EMPTY*/				%prec Op		{ $$ = NULL; }
@@ -17388,6 +17406,9 @@ opt_frame_clause:
 
 					n->frameOptions |= FRAMEOPTION_NONDEFAULT | FRAMEOPTION_RANGE;
 					n->frameOptions |= $3;
+					n->frameLocation = @1;
+					/* -1 when no EXCLUDE clause (opt_window_exclusion_clause returns 0) */
+					n->excludeLocation = ($3 != 0) ? @3 : -1;
 					$$ = n;
 				}
 			| ROWS frame_extent opt_window_exclusion_clause
@@ -17396,6 +17417,9 @@ opt_frame_clause:
 
 					n->frameOptions |= FRAMEOPTION_NONDEFAULT | FRAMEOPTION_ROWS;
 					n->frameOptions |= $3;
+					n->frameLocation = @1;
+					/* -1 when no EXCLUDE clause (opt_window_exclusion_clause returns 0) */
+					n->excludeLocation = ($3 != 0) ? @3 : -1;
 					$$ = n;
 				}
 			| GROUPS frame_extent opt_window_exclusion_clause
@@ -17404,6 +17428,9 @@ opt_frame_clause:
 
 					n->frameOptions |= FRAMEOPTION_NONDEFAULT | FRAMEOPTION_GROUPS;
 					n->frameOptions |= $3;
+					n->frameLocation = @1;
+					/* -1 when no EXCLUDE clause (opt_window_exclusion_clause returns 0) */
+					n->excludeLocation = ($3 != 0) ? @3 : -1;
 					$$ = n;
 				}
 			| /*EMPTY*/
@@ -17413,6 +17440,8 @@ opt_frame_clause:
 					n->frameOptions = FRAMEOPTION_DEFAULTS;
 					n->startOffset = NULL;
 					n->endOffset = NULL;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 		;
@@ -17488,6 +17517,8 @@ frame_bound:
 					n->frameOptions = FRAMEOPTION_START_UNBOUNDED_PRECEDING;
 					n->startOffset = NULL;
 					n->endOffset = NULL;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 			| UNBOUNDED FOLLOWING
@@ -17497,6 +17528,8 @@ frame_bound:
 					n->frameOptions = FRAMEOPTION_START_UNBOUNDED_FOLLOWING;
 					n->startOffset = NULL;
 					n->endOffset = NULL;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 			| CURRENT_P ROW
@@ -17506,6 +17539,8 @@ frame_bound:
 					n->frameOptions = FRAMEOPTION_START_CURRENT_ROW;
 					n->startOffset = NULL;
 					n->endOffset = NULL;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 			| a_expr PRECEDING
@@ -17515,6 +17550,8 @@ frame_bound:
 					n->frameOptions = FRAMEOPTION_START_OFFSET_PRECEDING;
 					n->startOffset = $1;
 					n->endOffset = NULL;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 			| a_expr FOLLOWING
@@ -17524,6 +17561,8 @@ frame_bound:
 					n->frameOptions = FRAMEOPTION_START_OFFSET_FOLLOWING;
 					n->startOffset = $1;
 					n->endOffset = NULL;
+					n->frameLocation = -1;
+					n->excludeLocation = -1;
 					$$ = n;
 				}
 		;
@@ -17536,6 +17575,332 @@ opt_window_exclusion_clause:
 			| /*EMPTY*/				{ $$ = 0; }
 		;
 
+opt_row_pattern_common_syntax:
+opt_row_pattern_skip_to opt_row_pattern_initial_or_seek
+				PATTERN_P '(' row_pattern ')'
+				DEFINE row_pattern_definition_list
+			{
+				RPCommonSyntax *n = makeNode(RPCommonSyntax);
+				n->rpSkipTo = $1;
+				n->initial = $2;
+				n->rpPattern = (RPRPatternNode *) $5;
+				n->rpDefs = $8;
+				$$ = (Node *) n;
+			}
+			| /*EMPTY*/		{ $$ = NULL; }
+		;
+
+opt_row_pattern_skip_to:
+			AFTER MATCH SKIP TO NEXT ROW
+				{
+					$$ = ST_NEXT_ROW;
+				}
+			| AFTER MATCH SKIP PAST LAST_P ROW
+				{
+					$$ = ST_PAST_LAST_ROW;
+				}
+			| /*EMPTY*/
+				{
+					$$ = ST_PAST_LAST_ROW;
+				}
+		;
+
+opt_row_pattern_initial_or_seek:
+			INITIAL		{ $$ = true; }
+			| SEEK
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("SEEK is not supported"),
+							 errhint("Use INITIAL instead."),
+							 parser_errposition(@1)));
+				}
+			| /*EMPTY*/		{ $$ = true; }
+		;
+
+row_pattern:
+			row_pattern_alt						{ $$ = $1; }
+		;
+
+row_pattern_alt:
+			row_pattern_seq						{ $$ = $1; }
+			| row_pattern_alt '|' row_pattern_seq
+				{
+					RPRPatternNode *n;
+					/* If left side is already ALT, append to it */
+					if (IsA($1, RPRPatternNode) &&
+						((RPRPatternNode *) $1)->nodeType == RPR_PATTERN_ALT)
+					{
+						n = (RPRPatternNode *) $1;
+						n->children = lappend(n->children, $3);
+						$$ = (Node *) n;
+					}
+					else
+					{
+						n = makeNode(RPRPatternNode);
+						n->nodeType = RPR_PATTERN_ALT;
+						n->children = list_make2($1, $3);
+						n->min = 1;
+						n->max = 1;
+						n->reluctant = false;
+						n->reluctant_location = -1;
+						n->location = @1;
+						$$ = (Node *) n;
+					}
+				}
+		;
+
+row_pattern_seq:
+			row_pattern_term					{ $$ = $1; }
+			| row_pattern_seq row_pattern_term
+				{
+					RPRPatternNode *n;
+					/* If left side is already SEQ, append to it */
+					if (IsA($1, RPRPatternNode) &&
+						((RPRPatternNode *) $1)->nodeType == RPR_PATTERN_SEQ)
+					{
+						n = (RPRPatternNode *) $1;
+						n->children = lappend(n->children, $2);
+						$$ = (Node *) n;
+					}
+					else
+					{
+						n = makeNode(RPRPatternNode);
+						n->nodeType = RPR_PATTERN_SEQ;
+						n->children = list_make2($1, $2);
+						n->min = 1;
+						n->max = 1;
+						n->reluctant = false;
+						n->reluctant_location = -1;
+						n->location = @1;
+						$$ = (Node *) n;
+					}
+				}
+		;
+
+row_pattern_term:
+			row_pattern_primary row_pattern_quantifier_opt
+				{
+					RPRPatternNode *n = (RPRPatternNode *) $1;
+					RPRPatternNode *q = (RPRPatternNode *) $2;
+
+					n->min = q->min;
+					n->max = q->max;
+					n->reluctant = q->reluctant;
+					n->reluctant_location = q->reluctant_location;
+					$$ = (Node *) n;
+				}
+		;
+
+row_pattern_primary:
+			ColId
+				{
+					RPRPatternNode *n = makeNode(RPRPatternNode);
+					n->nodeType = RPR_PATTERN_VAR;
+					n->varName = $1;
+					n->min = 1;
+					n->max = 1;
+					n->reluctant = false;
+					n->reluctant_location = -1;
+					n->children = NIL;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| '(' row_pattern ')'
+				{
+					RPRPatternNode *inner = (RPRPatternNode *) $2;
+					RPRPatternNode *n = makeNode(RPRPatternNode);
+					n->nodeType = RPR_PATTERN_GROUP;
+					n->children = list_make1(inner);
+					n->min = 1;
+					n->max = 1;
+					n->reluctant = false;
+					n->reluctant_location = -1;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+row_pattern_quantifier_opt:
+			/* EMPTY - no quantifier means exactly once; @$ is unused since
+			 * min=max=1 never produces an error */
+			{ $$ = (Node *) makeRPRQuantifier(1, 1, -1, @$, yyscanner); }
+			| '*'					{ $$ = (Node *) makeRPRQuantifier(0, INT_MAX, -1, @1, yyscanner); }
+			| '+'					{ $$ = (Node *) makeRPRQuantifier(1, INT_MAX, -1, @1, yyscanner); }
+			| Op
+				{
+					/* Handle single Op: ? or reluctant quantifiers *?, +?, ?? */
+					if (strcmp($1, "?") == 0)
+						$$ = (Node *) makeRPRQuantifier(0, 1, -1, @1, yyscanner);
+					else if (strcmp($1, "*?") == 0)
+						$$ = (Node *) makeRPRQuantifier(0, INT_MAX, @1 + 1, @1, yyscanner);
+					else if (strcmp($1, "+?") == 0)
+						$$ = (Node *) makeRPRQuantifier(1, INT_MAX, @1 + 1, @1, yyscanner);
+					else if (strcmp($1, "??") == 0)
+						$$ = (Node *) makeRPRQuantifier(0, 1, @1 + 1, @1, yyscanner);
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("unsupported quantifier \"%s\"", $1),
+								 errhint("Valid quantifiers are: *, +, ?, *?, +?, ??, {n}, {n,}, {,m}, {n,m} and their reluctant versions."),
+								 parser_errposition(@1)));
+				}
+			/* RELUCTANT quantifiers (when lexer separates tokens) */
+			| '*' Op
+				{
+					if (strcmp($2, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid token after \"*\" quantifier"),
+								 errhint("Did you mean \"*?\" for reluctant quantifier?"),
+								 parser_errposition(@2)));
+					$$ = (Node *) makeRPRQuantifier(0, INT_MAX, @2, @1, yyscanner);
+				}
+			| '+' Op
+				{
+					if (strcmp($2, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid token after \"+\" quantifier"),
+								 errhint("Did you mean \"+?\" for reluctant quantifier?"),
+								 parser_errposition(@2)));
+					$$ = (Node *) makeRPRQuantifier(1, INT_MAX, @2, @1, yyscanner);
+				}
+			| Op Op
+				{
+					if (strcmp($1, "?") != 0 || strcmp($2, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid quantifier combination"),
+								 errhint("Did you mean \"??\" for reluctant quantifier?"),
+								 parser_errposition(@1)));
+					$$ = (Node *) makeRPRQuantifier(0, 1, @2, @1, yyscanner);
+				}
+			/* {n}, {n,}, {,m}, {n,m} quantifiers */
+			| '{' Iconst '}'
+				{
+					if ($2 <= 0 || $2 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bound must be between 1 and %d", INT_MAX - 1),
+								parser_errposition(@2));
+					$$ = (Node *) makeRPRQuantifier($2, $2, -1, @1, yyscanner);
+				}
+			| '{' Iconst ',' '}'
+				{
+					if ($2 < 0 || $2 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bound must be between 0 and %d", INT_MAX - 1),
+								parser_errposition(@2));
+					$$ = (Node *) makeRPRQuantifier($2, INT_MAX, -1, @1, yyscanner);
+				}
+			| '{' ',' Iconst '}'
+				{
+					if ($3 <= 0 || $3 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bound must be between 1 and %d", INT_MAX - 1),
+								parser_errposition(@3));
+					$$ = (Node *) makeRPRQuantifier(0, $3, -1, @1, yyscanner);
+				}
+			| '{' Iconst ',' Iconst '}'
+				{
+					if ($2 < 0 || $4 <= 0 || $2 >= INT_MAX || $4 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bounds must be between 0 and %d with max >= 1", INT_MAX - 1),
+								parser_errposition(@2));
+					if ($2 > $4)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier minimum bound must not exceed maximum"),
+								parser_errposition(@2));
+					$$ = (Node *) makeRPRQuantifier($2, $4, -1, @1, yyscanner);
+				}
+			/* Reluctant versions: {n}?, {n,}?, {,m}?, {n,m}? */
+			| '{' Iconst '}' Op
+				{
+					if (strcmp($4, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid token after range quantifier"),
+								 errhint("Only \"?\" is allowed after {n} to make it reluctant."),
+								 parser_errposition(@4)));
+					if ($2 <= 0 || $2 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bound must be between 1 and %d", INT_MAX - 1),
+								parser_errposition(@2));
+					$$ = (Node *) makeRPRQuantifier($2, $2, @4, @1, yyscanner);
+				}
+			| '{' Iconst ',' '}' Op
+				{
+					if (strcmp($5, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid token after range quantifier"),
+								 errhint("Only \"?\" is allowed after {n,} or {,m} to make it reluctant."),
+								 parser_errposition(@5)));
+					if ($2 < 0 || $2 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bound must be between 0 and %d", INT_MAX - 1),
+								parser_errposition(@2));
+					$$ = (Node *) makeRPRQuantifier($2, INT_MAX, @5, @1, yyscanner);
+				}
+			| '{' ',' Iconst '}' Op
+				{
+					if (strcmp($5, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid token after range quantifier"),
+								 errhint("Only \"?\" is allowed after {n,} or {,m} to make it reluctant."),
+								 parser_errposition(@5)));
+					if ($3 <= 0 || $3 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bound must be between 1 and %d", INT_MAX - 1),
+								parser_errposition(@3));
+					$$ = (Node *) makeRPRQuantifier(0, $3, @5, @1, yyscanner);
+				}
+			| '{' Iconst ',' Iconst '}' Op
+				{
+					if (strcmp($6, "?") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("invalid token after range quantifier"),
+								 errhint("Only \"?\" is allowed after {n,m} to make it reluctant."),
+								 parser_errposition(@6)));
+					if ($2 < 0 || $4 <= 0 || $2 >= INT_MAX || $4 >= INT_MAX)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier bounds must be between 0 and %d with max >= 1", INT_MAX - 1),
+								parser_errposition(@2));
+					if ($2 > $4)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("quantifier minimum bound must not exceed maximum"),
+								parser_errposition(@2));
+					$$ = (Node *) makeRPRQuantifier($2, $4, @6, @1, yyscanner);
+				}
+		;
+
+row_pattern_definition_list:
+			row_pattern_definition										{ $$ = list_make1($1); }
+			| row_pattern_definition_list ',' row_pattern_definition	{ $$ = lappend($1, $3); }
+		;
+
+row_pattern_definition:
+			ColId AS a_expr
+				{
+					$$ = makeNode(ResTarget);
+					$$->name = $1;
+					$$->indirection = NIL;
+					$$->val = (Node *) $3;
+					$$->location = @1;
+				}
+		;
 
 /*
  * Supporting nonterminals for expressions.
@@ -18885,6 +19250,7 @@ unreserved_keyword:
 			| DECLARE
 			| DEFAULTS
 			| DEFERRED
+			| DEFINE
 			| DEFINER
 			| DELETE_P
 			| DELIMITER
@@ -18953,6 +19319,7 @@ unreserved_keyword:
 			| INDEXES
 			| INHERIT
 			| INHERITS
+			| INITIAL
 			| INLINE_P
 			| INPUT_P
 			| INSENSITIVE
@@ -19029,7 +19396,9 @@ unreserved_keyword:
 			| PARTITIONS
 			| PASSING
 			| PASSWORD
+			| PAST
 			| PATH
+			| PATTERN_P
 			| PERIOD
 			| PLAN
 			| PLANS
@@ -19088,6 +19457,7 @@ unreserved_keyword:
 			| SEARCH
 			| SECOND_P
 			| SECURITY
+			| SEEK
 			| SEQUENCE
 			| SEQUENCES
 			| SERIALIZABLE
@@ -19477,6 +19847,7 @@ bare_label_keyword:
 			| DEFAULTS
 			| DEFERRABLE
 			| DEFERRED
+			| DEFINE
 			| DEFINER
 			| DELETE_P
 			| DELIMITER
@@ -19559,6 +19930,7 @@ bare_label_keyword:
 			| INDEXES
 			| INHERIT
 			| INHERITS
+			| INITIAL
 			| INITIALLY
 			| INLINE_P
 			| INNER_P
@@ -19673,7 +20045,9 @@ bare_label_keyword:
 			| PARTITIONS
 			| PASSING
 			| PASSWORD
+			| PAST
 			| PATH
+			| PATTERN_P
 			| PERIOD
 			| PLACING
 			| PLAN
@@ -19737,6 +20111,7 @@ bare_label_keyword:
 			| SCROLL
 			| SEARCH
 			| SECURITY
+			| SEEK
 			| SELECT
 			| SEQUENCE
 			| SEQUENCES
@@ -20929,6 +21304,24 @@ makeRecursiveViewSelect(char *relname, List *aliases, Node *query)
 	s->fromClause = list_make1(makeRangeVar(NULL, relname, -1));
 
 	return (Node *) s;
+}
+
+/*
+ * makeRPRQuantifier
+ *		Create an RPRPatternNode with specified quantifier bounds.
+ */
+static RPRPatternNode *
+makeRPRQuantifier(int min, int max, ParseLoc reluctant_location, int location,
+				  core_yyscan_t yyscanner)
+{
+	RPRPatternNode *n = makeNode(RPRPatternNode);
+
+	n->min = min;
+	n->max = max;
+	n->reluctant = (reluctant_location >= 0);
+	n->reluctant_location = reluctant_location;
+	n->location = location;
+	return n;
 }
 
 /* parser_init()

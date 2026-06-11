@@ -61,7 +61,16 @@ endif
 
 # XXX: Need to determine proper version of the function cflags for clang
 bitcode_cflags = ['-fno-strict-aliasing', '-fwrapv']
-bitcode_cflags += get_option('c_args')
+
+# Filter out sanitizer flags from c_args for bitcode generation.
+# Sanitizer instrumentation changes struct layouts in LLVM IR, which breaks
+# the JIT's assumptions about field offsets.
+foreach cflag : get_option('c_args')
+  if not cflag.contains('sanitize')
+    bitcode_cflags += cflag
+  endif
+endforeach
+
 bitcode_cflags += cppflags
 
 # XXX: Worth improving on the logic to find directories here

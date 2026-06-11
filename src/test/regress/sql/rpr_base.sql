@@ -1,0 +1,4130 @@
+-- ============================================================
+-- RPR Base Tests
+-- Tests for Row Pattern Recognition (ISO/IEC 19075-5:2016)
+-- ============================================================
+--
+-- Parser Layer:
+--   Keyword Usage Tests
+--   DEFINE Clause Tests
+--   FRAME Options Tests
+--   PARTITION BY + FRAME Tests
+--   PATTERN Syntax Tests
+--   Quantifiers Tests
+--   Navigation Functions Tests
+--   SKIP TO / INITIAL Tests
+--   Serialization/Deserialization Tests (objects kept for pg_upgrade/pg_dump)
+--   Error Cases Tests
+--   Window Deduplication Tests
+--
+-- Planner Layer:
+--   Pattern Optimization Tests
+--   Absorption Flag Display Tests
+--   Absorption Analysis Tests
+--   Edge Case Tests
+--   Optimization Fallback Tests
+--   Planner Integration Tests
+--   Subquery and CTE Tests
+--   JOIN Tests
+--   Complex Expression Tests
+--   Set Operations Tests
+--   Sorting and Grouping Tests
+--   SQL Function Inlining Tests
+--   Stress Tests
+--   Error Limit Tests
+--
+-- Contributed Tests:
+--   Jacob's Patterns
+--   Pathological Patterns
+-- ============================================================
+
+SET client_min_messages = WARNING;
+
+-- ============================================================
+-- Keyword Usage Tests
+-- ============================================================
+
+-- RPR keywords as column names
+-- Keywords: define, initial, past, pattern, seek
+
+CREATE TABLE rpr_keywords (
+    id INT,
+    define INT,      -- DEFINE keyword
+    initial INT,     -- INITIAL keyword
+    past INT,        -- PAST keyword
+    pattern INT,     -- PATTERN keyword
+    seek INT,        -- SEEK keyword
+    skip INT         -- SKIP keyword (pre-existing)
+);
+
+INSERT INTO rpr_keywords VALUES (1, 10, 20, 30, 40, 50, 60);
+
+SELECT id, define, initial, past, pattern, seek, skip
+FROM rpr_keywords
+ORDER BY id;
+
+DROP TABLE rpr_keywords;
+
+-- ============================================================
+-- DEFINE Clause Tests
+-- ============================================================
+
+
+-- Simple column references
+CREATE TABLE stock_price (
+    dt DATE,
+    symbol TEXT,
+    price NUMERIC,
+    volume INT
+);
+
+INSERT INTO stock_price VALUES
+    ('2024-01-01', 'AAPL', 150, 1000),
+    ('2024-01-02', 'AAPL', 155, 1200),
+    ('2024-01-03', 'AAPL', 152, 900),
+    ('2024-01-04', 'AAPL', 160, 1500),
+    ('2024-01-05', 'AAPL', 158, 1100);
+
+-- Simple column reference
+SELECT dt, price, COUNT(*) OVER w as cnt
+FROM stock_price
+WINDOW w AS (
+    PARTITION BY symbol
+    ORDER BY dt
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (UP+)
+    DEFINE UP AS price > 150
+)
+ORDER BY dt;
+
+-- Multiple column references
+SELECT dt, price, volume, COUNT(*) OVER w as cnt
+FROM stock_price
+WINDOW w AS (
+    PARTITION BY symbol
+    ORDER BY dt
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (GOOD+)
+    DEFINE GOOD AS price > 150 AND volume > 1000
+)
+ORDER BY dt;
+
+-- Expression in DEFINE
+SELECT dt, price, COUNT(*) OVER w as cnt
+FROM stock_price
+WINDOW w AS (
+    PARTITION BY symbol
+    ORDER BY dt
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (HIGH+)
+    DEFINE HIGH AS price * 1.1 > 165
+)
+ORDER BY dt;
+
+-- Arithmetic and functions
+SELECT dt, price, volume, COUNT(*) OVER w as cnt
+FROM stock_price
+WINDOW w AS (
+    PARTITION BY symbol
+    ORDER BY dt
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (CALC+)
+    DEFINE CALC AS (price + volume / 100) > 160
+)
+ORDER BY dt;
+
+DROP TABLE stock_price;
+
+-- Auto-generated DEFINE
+CREATE TABLE rpr_auto (id INT, val INT);
+INSERT INTO rpr_auto VALUES (1, 10), (2, 20), (3, 30), (4, 15);
+
+-- One variable undefined (B auto-generated as "B IS TRUE")
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_auto
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ B*)
+    DEFINE A AS val > 15
+)
+ORDER BY id;
+
+-- Multiple undefined variables
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_auto
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B C)
+    DEFINE A AS val > 0
+    -- B and C auto-generated as "B IS TRUE", "C IS TRUE"
+)
+ORDER BY id;
+
+-- All variables defined explicitly
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_auto
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (X Y Z)
+    DEFINE
+        X AS val > 10,
+        Y AS val > 20,
+        Z AS val < 20
+)
+ORDER BY id;
+
+DROP TABLE rpr_auto;
+
+-- Duplicate variable names
+CREATE TABLE rpr_dup (id INT);
+INSERT INTO rpr_dup VALUES (1), (2);
+
+-- Duplicate DEFINE entries
+SELECT COUNT(*) OVER w
+FROM rpr_dup
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS id > 0, A AS id < 10
+);
+-- Expected: ERROR: row pattern definition variable name "a" appears more than once in DEFINE clause
+
+DROP TABLE rpr_dup;
+
+-- Boolean coercion
+CREATE TABLE rpr_bool (id INT, flag BOOLEAN);
+INSERT INTO rpr_bool VALUES (1, true), (2, false);
+
+-- Non-boolean expression
+SELECT COUNT(*) OVER w
+FROM rpr_bool
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS id
+);
+-- Expected: ERROR: argument of DEFINE must be type boolean
+
+-- Boolean column reference
+SELECT id, flag, COUNT(*) OVER w as cnt
+FROM rpr_bool
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (T+)
+    DEFINE T AS flag
+)
+ORDER BY id;
+
+-- NULL::boolean
+SELECT id, COUNT(*) OVER w as cnt
+FROM rpr_bool
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (N+)
+    DEFINE N AS NULL::boolean
+)
+ORDER BY id;
+
+-- Implicit cast to boolean via custom type
+CREATE TYPE truthyint AS (v int);
+CREATE FUNCTION truthyint_to_bool(truthyint) RETURNS boolean AS $$
+  SELECT ($1).v <> 0;
+$$ LANGUAGE SQL IMMUTABLE STRICT;
+CREATE CAST (truthyint AS boolean)
+  WITH FUNCTION truthyint_to_bool(truthyint)
+  AS ASSIGNMENT;
+
+CREATE TABLE rpr_coerce (id int, val truthyint);
+INSERT INTO rpr_coerce VALUES (1, ROW(1)), (2, ROW(0)), (3, ROW(5)), (4, ROW(0));
+
+SELECT id, val, cnt
+FROM (SELECT id, val,
+             COUNT(*) OVER w AS cnt
+      FROM rpr_coerce
+      WINDOW w AS (
+          ORDER BY id
+          ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+          PATTERN (A+)
+          DEFINE A AS val
+      )
+) s ORDER BY id;
+
+DROP TABLE rpr_coerce;
+DROP CAST (truthyint AS boolean);
+DROP FUNCTION truthyint_to_bool(truthyint);
+DROP TYPE truthyint;
+
+DROP TABLE rpr_bool;
+
+-- Complex expressions
+CREATE TABLE rpr_complex (id INT, val1 INT, val2 INT);
+INSERT INTO rpr_complex VALUES (1, 10, 20), (2, 15, 25), (3, 20, 30);
+
+-- CASE expression
+SELECT id, val1, val2, COUNT(*) OVER w as cnt
+FROM rpr_complex
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (C+)
+    DEFINE C AS CASE WHEN val1 > 10 THEN val2 > 20 ELSE false END
+)
+ORDER BY id;
+
+DROP TABLE rpr_complex;
+
+-- Pattern variable not in PATTERN (should be ignored)
+CREATE TABLE rpr_unused (id INT);
+INSERT INTO rpr_unused VALUES (1), (2);
+
+-- Extra DEFINE variable
+SELECT id, COUNT(*) OVER w as cnt
+FROM rpr_unused
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS id > 0, B AS id > 5  -- B not in pattern
+)
+ORDER BY id;
+
+DROP TABLE rpr_unused;
+
+-- ============================================================
+-- FRAME Options Tests
+-- ============================================================
+
+
+CREATE TABLE rpr_frame (id INT, val INT);
+INSERT INTO rpr_frame VALUES
+    (1, 10), (2, 10), (3, 10),  -- Same val: 10
+    (4, 20), (5, 20),           -- Same val: 20
+    (6, 30);
+
+-- Valid frame options
+
+-- ROWS: counts physical rows (1 FOLLOWING = next 1 physical row)
+-- Expected result: Each row can see 1 physical row ahead
+-- id=1,2,3 (val=10): can see next row -> cnt=2
+-- id=4,5 (val=20): can see next row -> cnt=2
+-- id=6 (val=30): no next row -> cnt=1
+-- Result: [2,2,2,2,2,1]
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY val
+    ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A B?)
+    DEFINE A AS val >= 0, B AS val >= 0
+)
+ORDER BY id;
+
+-- Invalid frame start positions
+
+-- Not starting at CURRENT ROW
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: FRAME must start at current row when row pattern recognition is used
+
+-- EXCLUDE options
+
+-- EXCLUDE not permitted
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    EXCLUDE CURRENT ROW
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: cannot use EXCLUDE options with row pattern recognition
+
+-- EXCLUDE GROUP not permitted
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    EXCLUDE GROUP
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: cannot use EXCLUDE options with row pattern recognition
+
+-- EXCLUDE TIES not permitted
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    EXCLUDE TIES
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: cannot use EXCLUDE options with row pattern recognition
+
+-- RANGE frame not starting at CURRENT ROW
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: cannot use FRAME option RANGE with row pattern recognition
+
+-- GROUPS frame not starting at CURRENT ROW
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    GROUPS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: cannot use FRAME option GROUPS with row pattern recognition
+
+-- Starting with N PRECEDING
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: FRAME must start at current row when row pattern recognition is used
+
+-- Starting with N FOLLOWING
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: FRAME must start at current row when row pattern recognition is used
+
+-- Frame end bound edge cases
+
+-- End before start: CURRENT ROW AND 1 PRECEDING
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND 1 PRECEDING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: frame starting from current row cannot have preceding rows
+
+-- End before start: CURRENT ROW AND UNBOUNDED PRECEDING
+SELECT COUNT(*) OVER w
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: frame end cannot be UNBOUNDED PRECEDING
+
+-- Single row frame: CURRENT ROW AND CURRENT ROW
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND CURRENT ROW
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Zero offset: CURRENT ROW AND 0 FOLLOWING (equivalent to CURRENT ROW)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND 0 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Large offset: CURRENT ROW AND 1000 FOLLOWING
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND 1000 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Maximum offset: CURRENT ROW AND 2147483646 FOLLOWING (INT_MAX - 1)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND 2147483646 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- RANGE frame with RPR (not permitted)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY val
+    RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A B?)
+    DEFINE A AS val >= 0, B AS val >= 0
+)
+ORDER BY id;
+-- Expected: ERROR: cannot use FRAME option RANGE with row pattern recognition
+
+-- GROUPS frame with RPR (not permitted)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_frame
+WINDOW w AS (
+    ORDER BY val
+    GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A B?)
+    DEFINE A AS val >= 0, B AS val >= 0
+)
+ORDER BY id;
+-- Expected: ERROR: cannot use FRAME option GROUPS with row pattern recognition
+
+DROP TABLE rpr_frame;
+
+-- ============================================================
+-- PARTITION BY + FRAME Tests
+-- ============================================================
+
+-- Test PARTITION BY with RPR to ensure proper partitioning behavior
+CREATE TABLE rpr_partition (id INT, grp INT, val INT);
+INSERT INTO rpr_partition VALUES
+    (1, 1, 10), (2, 1, 20), (3, 1, 30),
+    (4, 2, 15), (5, 2, 25), (6, 2, 35);
+
+-- PARTITION BY with ROWS frame
+SELECT id, grp, val, COUNT(*) OVER w as cnt
+FROM rpr_partition
+WINDOW w AS (
+    PARTITION BY grp
+    ORDER BY val
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A B+)
+    DEFINE A AS val >= 10, B AS val > 15
+)
+ORDER BY id;
+-- Expected: Pattern matching should reset for each partition
+
+-- PARTITION BY with RANGE frame
+SELECT id, grp, val, COUNT(*) OVER w as cnt
+FROM rpr_partition
+WINDOW w AS (
+    PARTITION BY grp
+    ORDER BY val
+    RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A B?)
+    DEFINE A AS val >= 10, B AS val >= 20
+)
+ORDER BY id;
+-- Expected: ERROR: cannot use FRAME option RANGE with row pattern recognition
+
+DROP TABLE rpr_partition;
+
+-- ============================================================
+-- PATTERN Syntax Tests
+-- ============================================================
+
+
+CREATE TABLE rpr_pattern (id INT, val INT);
+INSERT INTO rpr_pattern VALUES
+    (1, 5), (2, 10), (3, 15), (4, 20), (5, 25),
+    (6, 30), (7, 35), (8, 40), (9, 45), (10, 50);
+
+-- Alternation (|)
+
+-- Multiple alternatives
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_pattern
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ | B+ | C+)
+    DEFINE A AS val > 35, B AS val BETWEEN 15 AND 35, C AS val < 15
+)
+ORDER BY id;
+
+-- Grouping
+
+-- Nested grouping with quantifier
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_pattern
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (((A B) C)+)
+    DEFINE A AS val > 10, B AS val > 20, C AS val > 30
+)
+ORDER BY id;
+
+-- Sequence
+
+-- Multi-element sequence
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_pattern
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B C D E)
+    DEFINE
+        A AS val < 15,
+        B AS val BETWEEN 15 AND 25,
+        C AS val BETWEEN 25 AND 35,
+        D AS val BETWEEN 35 AND 45,
+        E AS val >= 45
+)
+ORDER BY id;
+
+-- Complex combinations
+
+-- Alternation with grouping
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_pattern
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A B) | (C D))
+    DEFINE A AS val < 20, B AS val >= 20, C AS val < 30, D AS val >= 30
+)
+ORDER BY id;
+
+-- Alternation + sequence + grouping
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_pattern
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (START (UP{2,} DOWN? | FLAT+) FINISH)
+    DEFINE
+        START AS val >= 0,
+        UP AS val > 20,
+        DOWN AS val <= 30,
+        FLAT AS val BETWEEN 25 AND 35,
+        FINISH AS val > 40
+)
+ORDER BY id;
+
+-- Nested alternation in groups
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_pattern
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A | B) (C | D))
+    DEFINE A AS val < 15, B AS val BETWEEN 15 AND 25, C AS val BETWEEN 25 AND 35, D AS val > 35
+)
+ORDER BY id;
+
+DROP TABLE rpr_pattern;
+
+-- ============================================================
+-- Quantifiers Tests
+-- ============================================================
+
+
+CREATE TABLE rpr_quant (id INT, val INT);
+INSERT INTO rpr_quant VALUES
+    (1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+    (6, 60), (7, 70), (8, 80), (9, 90), (10, 100);
+
+-- Basic greedy quantifiers
+
+-- * (zero or more)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A*)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- + (one or more)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 50
+)
+ORDER BY id;
+
+-- ? (zero or one)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A?)
+    DEFINE A AS val = 50
+)
+ORDER BY id;
+
+-- Edge case quantifiers
+
+-- {0} is not allowed (min must be >= 1)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{0} B)
+    DEFINE A AS val > 1000, B AS val > 0
+)
+ORDER BY id;
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+-- {0,0} is not allowed (max must be >= 1)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{0,0} B)
+    DEFINE A AS val > 1000, B AS val > 0
+)
+ORDER BY id;
+-- Expected: ERROR: quantifier bounds must be between 0 and 2147483646 with max >= 1
+
+-- {0,1} (equivalent to ?)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{0,1})
+    DEFINE A AS val = 50
+)
+ORDER BY id;
+
+-- Exact quantifiers {n}
+
+-- {3} (representative exact quantifier)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{3})
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Range quantifiers {n,}
+
+-- {2,} (representative n or more)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2,})
+    DEFINE A AS val > 40
+)
+ORDER BY id;
+
+-- Upper bound quantifiers {,m}
+
+-- {,3} (representative up to m)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,3})
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Range quantifiers {n,m}
+
+-- {3,7} (representative range)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_quant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{3,7})
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+DROP TABLE rpr_quant;
+
+-- Reluctant quantifiers
+CREATE TABLE rpr_reluctant (id INT, val INT);
+INSERT INTO rpr_reluctant VALUES (1, 10), (2, 20), (3, 30);
+
+-- *? (zero or more, reluctant)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A*?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- +? (one or more, reluctant)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- ?? (zero or one, reluctant)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A??)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- {n,}? (n or more, reluctant)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2,}?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- {n,m}? (n to m, reluctant)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{1,3}?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- {n}? (exactly n, reluctant)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2}?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- {,m}? (up to m, reluctant) - COMPLETELY UNTESTED RULE!
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,3}?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- Invalid reluctant patterns (wrong token after quantifier)
+
+-- {2}+ (should be {2}? not {2}+)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2}+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "+"
+
+-- {2,}* (should be {2,}? not {2,}*)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2,}*)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "*"
+
+-- {,3}* (should be {,3}? not {,3}*)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,3}*)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "*"
+
+-- {1,3}+ (should be {1,3}? not {1,3}+)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{1,3}+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "+"
+
+-- Boundary errors in reluctant quantifiers
+
+-- {-1}? (negative bound)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{-1}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "-"
+
+-- {2147483647}? (INT_MAX)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2147483647}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+-- {-1,}? (negative lower bound)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{-1,}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "-"
+
+-- {2147483647,}? (INT_MAX lower bound)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2147483647,}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: quantifier bound must be between 0 and 2147483646
+
+-- {,0}? (zero upper bound)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,0}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+-- {,2147483647}? (INT_MAX upper bound)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,2147483647}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+-- {-1,3}? (negative lower in range)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{-1,3}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "-"
+
+-- {1,2147483647}? (INT_MAX upper in range)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{1,2147483647}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: quantifier bounds must be between 0 and 2147483646 with max >= 1
+
+-- {5,3}? (min > max)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{5,3}?)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: quantifier minimum bound must not exceed maximum
+
+-- Token-separated reluctant quantifiers (space between quantifier and ?)
+-- These may be tokenized differently by the lexer
+
+-- * ? (token separated)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A* ?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- + ? (token separated)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ ?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- {2,} ? (token separated)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2,} ?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+-- Invalid token combinations
+
+-- * + (invalid combination)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A* +)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "+"
+
+-- + * (invalid combination)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ *)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: syntax error at or near "*"
+
+-- ? ? (parsed as ?? reluctant quantifier)
+SELECT COUNT(*) OVER w
+FROM rpr_reluctant
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A? ?)
+    DEFINE A AS val > 0
+);
+-- Reluctant quantifier: prefer shortest match
+
+DROP TABLE rpr_reluctant;
+
+-- Quantifier boundary conditions
+
+CREATE TABLE rpr_bounds (id INT);
+INSERT INTO rpr_bounds VALUES (1), (2);
+
+-- min > max
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{5,3})
+    DEFINE A AS id > 0
+);
+-- Expected: ERROR: quantifier minimum bound must not exceed maximum
+
+-- Large bounds
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{1000,2000})
+    DEFINE A AS id > 0
+);
+
+-- Very large bound
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{100000})
+    DEFINE A AS id > 0
+);
+
+-- INT_MAX - 1 = 2147483646 (at limit)
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2147483646})
+    DEFINE A AS id > 0
+);
+
+-- INT_MAX = 2147483647 (over limit)
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2147483647})
+    DEFINE A AS id > 0
+);
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+-- {n,} boundary errors
+
+-- Negative lower bound in {n,}
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{-1,})
+    DEFINE A AS id > 0
+);
+-- Expected: ERROR: syntax error at or near "-"
+
+-- INT_MAX in {n,}
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2147483647,})
+    DEFINE A AS id > 0
+);
+-- Expected: ERROR: quantifier bound must be between 0 and 2147483646
+
+-- {,m} boundary errors
+
+-- Zero upper bound in {,m}
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,0})
+    DEFINE A AS id > 0
+);
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+-- INT_MAX in {,m}
+SELECT COUNT(*) OVER w
+FROM rpr_bounds
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{,2147483647})
+    DEFINE A AS id > 0
+);
+-- Expected: ERROR: quantifier bound must be between 1 and 2147483646
+
+DROP TABLE rpr_bounds;
+
+-- ============================================================
+-- Navigation Functions Tests (PREV / NEXT / FIRST / LAST)
+-- ============================================================
+
+
+CREATE TABLE rpr_nav (id INT, val INT);
+INSERT INTO rpr_nav VALUES
+    (1, 10), (2, 20), (3, 15), (4, 25), (5, 30);
+
+-- PREV function - reference previous row in pattern
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B+)
+    DEFINE
+        A AS val > 0,
+        B AS val > PREV(val)
+)
+ORDER BY id;
+
+-- NEXT function - reference next row in pattern
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ B)
+    DEFINE
+        A AS val < NEXT(val),
+        B AS val > 0
+)
+ORDER BY id;
+
+-- Combined PREV and NEXT
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B C)
+    DEFINE
+        A AS val > 0,
+        B AS val > PREV(val) AND val < NEXT(val),
+        C AS val > PREV(val)
+)
+ORDER BY id;
+
+-- PREV function cannot be used other than in DEFINE
+SELECT PREV(id), id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B+)
+    DEFINE
+        A AS val > 0,
+        B AS val > PREV(val)
+)
+ORDER BY id;
+-- Expected: ERROR: cannot use prev outside a DEFINE clause
+
+-- NEXT function cannot be used other than in DEFINE
+SELECT NEXT(id), id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B+)
+    DEFINE
+        A AS val > 0,
+        B AS val > PREV(val)
+)
+ORDER BY id;
+-- Expected: ERROR: cannot use next outside a DEFINE clause
+
+-- FIRST function - reference match_start row
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B+)
+    DEFINE
+        A AS val > 0,
+        B AS val > FIRST(val)
+)
+ORDER BY id;
+
+-- LAST function without offset - equivalent to current row's value
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B+)
+    DEFINE
+        A AS val > 0,
+        B AS LAST(val) > PREV(val)
+)
+ORDER BY id;
+
+-- FIRST and LAST combined
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_nav
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B+)
+    DEFINE
+        A AS val > 0,
+        B AS val > FIRST(val) AND LAST(val) > PREV(val)
+)
+ORDER BY id;
+
+-- FIRST function cannot be used other than in DEFINE
+SELECT FIRST(id), id, val FROM rpr_nav;
+-- Expected: ERROR: cannot use first outside a DEFINE clause
+
+-- LAST function cannot be used other than in DEFINE
+SELECT LAST(id), id, val FROM rpr_nav;
+-- Expected: ERROR: cannot use last outside a DEFINE clause
+
+DROP TABLE rpr_nav;
+
+-- ============================================================
+-- SKIP TO / INITIAL Tests
+-- ============================================================
+
+
+CREATE TABLE rpr_skip (id INT, val INT);
+INSERT INTO rpr_skip VALUES
+    (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+    (6, 6), (7, 7), (8, 8);
+
+-- SKIP TO NEXT ROW
+
+-- SKIP TO NEXT ROW
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_skip
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A B C)
+    DEFINE A AS val > 0, B AS val > 2, C AS val > 4
+)
+ORDER BY id;
+
+-- SKIP PAST LAST ROW
+
+-- SKIP PAST LAST ROW
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_skip
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B C)
+    DEFINE A AS val > 0, B AS val > 2, C AS val > 4
+)
+ORDER BY id;
+
+-- Default behavior (should be SKIP PAST LAST ROW)
+
+-- No SKIP TO clause (default)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_skip
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B)
+    DEFINE A AS val > 0, B AS val > 1
+)
+ORDER BY id;
+
+-- Compare default with explicit PAST LAST ROW
+-- Results should be identical
+WITH default_skip AS (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_skip
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A B C)
+        DEFINE A AS val > 0, B AS val > 2, C AS val > 4
+    )
+),
+explicit_skip AS (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_skip
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        AFTER MATCH SKIP PAST LAST ROW
+        PATTERN (A B C)
+        DEFINE A AS val > 0, B AS val > 2, C AS val > 4
+    )
+)
+SELECT 'default' as type, * FROM default_skip
+UNION ALL
+SELECT 'explicit' as type, * FROM explicit_skip
+ORDER BY type, id;
+
+DROP TABLE rpr_skip;
+
+-- INITIAL clause
+
+CREATE TABLE rpr_init (id INT, val INT);
+INSERT INTO rpr_init VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+-- Explicit INITIAL
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_init
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    INITIAL
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Implicit INITIAL (default)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_init
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+DROP TABLE rpr_init;
+
+-- SEEK
+
+CREATE TABLE rpr_seek (id INT, val INT);
+INSERT INTO rpr_seek VALUES (1, 10);
+
+-- SEEK keyword
+SELECT COUNT(*) OVER w
+FROM rpr_seek
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    SEEK
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR: SEEK is not supported
+-- HINT: Use INITIAL instead.
+
+DROP TABLE rpr_seek;
+
+-- ============================================================
+-- Serialization/Deserialization Tests
+-- ============================================================
+
+
+-- View creation and deparsing
+
+CREATE TABLE rpr_serial (id INT, val INT);
+INSERT INTO rpr_serial VALUES
+    (1, 10), (2, 20), (3, 15), (4, 25), (5, 30);
+
+-- Simple pattern
+CREATE VIEW rpr_serial_v1 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+
+-- Verify view works (tests deserialization)
+SELECT * FROM rpr_serial_v1 ORDER BY id;
+
+-- Verify deparsing
+SELECT pg_get_viewdef('rpr_serial_v1'::regclass);
+
+-- Complex pattern with alternation
+CREATE VIEW rpr_serial_v2 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ | B*)
+    DEFINE A AS val > 20, B AS val <= 20
+);
+
+SELECT * FROM rpr_serial_v2 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v2'::regclass);
+
+-- Pattern with grouping and quantifiers
+CREATE VIEW rpr_serial_v3 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A B){2,5} | C*)
+    DEFINE
+        A AS val > 10,
+        B AS val > 20,
+        C AS val <= 10
+);
+
+SELECT * FROM rpr_serial_v3 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v3'::regclass);
+
+-- All features combined
+CREATE VIEW rpr_serial_v4 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    INITIAL
+    PATTERN (START (MID{1,3} | ALT+) FINISH)
+    DEFINE
+        START AS val > 5,
+        MID AS val BETWEEN 10 AND 25,
+        ALT AS val > 25,
+        FINISH AS val > 15
+);
+
+SELECT * FROM rpr_serial_v4 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v4'::regclass);
+
+-- Additional quantifiers for deparsing coverage
+
+-- ? quantifier (zero or one)
+CREATE VIEW rpr_serial_v5 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B?)
+    DEFINE A AS val > 10, B AS val > 20
+);
+
+SELECT * FROM rpr_serial_v5 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v5'::regclass);
+
+-- {n,} quantifier (n or more)
+CREATE VIEW rpr_serial_v6 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2,})
+    DEFINE A AS val > 15
+);
+
+SELECT * FROM rpr_serial_v6 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v6'::regclass);
+
+-- {n} quantifier (exactly n)
+CREATE VIEW rpr_serial_v7 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{3})
+    DEFINE A AS val > 0
+);
+
+SELECT * FROM rpr_serial_v7 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v7'::regclass);
+
+-- Nested ALT pattern (tests deparse of complex nested structure)
+CREATE VIEW rpr_serial_v8 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_serial
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (((A+ B) | C) D | A B C)
+    DEFINE A AS val <= 15, B AS val <= 25, C AS val <= 30, D AS val > 30
+);
+
+SELECT * FROM rpr_serial_v8 ORDER BY id;
+SELECT pg_get_viewdef('rpr_serial_v8'::regclass);
+
+-- Navigation function serialization: PREV with offset
+CREATE VIEW rpr_serial_nav1 AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B+)
+             DEFINE A AS TRUE, B AS val > PREV(val, 2));
+SELECT pg_get_viewdef('rpr_serial_nav1'::regclass);
+
+-- Navigation function serialization: FIRST and LAST
+CREATE VIEW rpr_serial_nav2 AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B+)
+             DEFINE A AS TRUE, B AS FIRST(val) < LAST(val, 1));
+SELECT pg_get_viewdef('rpr_serial_nav2'::regclass);
+
+-- Navigation function serialization: compound PREV(FIRST())
+CREATE VIEW rpr_serial_nav3 AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B+)
+             DEFINE A AS TRUE, B AS PREV(FIRST(val, 1), 2) > 0);
+SELECT pg_get_viewdef('rpr_serial_nav3'::regclass);
+
+-- Navigation function serialization: compound NEXT(LAST())
+CREATE VIEW rpr_serial_nav4 AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B+)
+             DEFINE A AS TRUE, B AS NEXT(LAST(val), 2) IS NOT NULL);
+SELECT pg_get_viewdef('rpr_serial_nav4'::regclass);
+
+-- Navigation function serialization: compound PREV(LAST())
+CREATE VIEW rpr_serial_nav5 AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B+)
+             DEFINE A AS TRUE, B AS PREV(LAST(val, 1), 2) > 0);
+SELECT pg_get_viewdef('rpr_serial_nav5'::regclass);
+
+-- Navigation function serialization: compound NEXT(FIRST())
+CREATE VIEW rpr_serial_nav6 AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B+)
+             DEFINE A AS TRUE, B AS NEXT(FIRST(val), 3) > 0);
+SELECT pg_get_viewdef('rpr_serial_nav6'::regclass);
+
+-- Reluctant {1}? quantifier deparse through ruleutils
+CREATE VIEW rpr_quant_reluctant_v AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             INITIAL
+             PATTERN (A{1}? B)
+             DEFINE A AS val > 0, B AS val > 0);
+SELECT pg_get_viewdef('rpr_quant_reluctant_v'::regclass);
+
+-- Quoted identifier round-trip: mixed case and reserved words need quoting
+CREATE VIEW rpr_serial_quoted AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ("Start" "Up"+)
+             DEFINE "Start" AS TRUE, "Up" AS val > PREV(val));
+SELECT pg_get_viewdef('rpr_serial_quoted'::regclass);
+
+-- Materialized view (if supported)
+
+CREATE TABLE rpr_mview (id INT, val INT);
+INSERT INTO rpr_mview VALUES (1, 10), (2, 20), (3, 30);
+
+CREATE MATERIALIZED VIEW rpr_mview_v1 AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_mview
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+);
+
+SELECT * FROM rpr_mview_v1 ORDER BY id;
+SELECT pg_get_viewdef('rpr_mview_v1'::regclass);
+
+-- Refresh test
+REFRESH MATERIALIZED VIEW rpr_mview_v1;
+SELECT * FROM rpr_mview_v1 ORDER BY id;
+
+-- CREATE TABLE AS SELECT with RPR
+CREATE TABLE rpr_ctas (id INT, val INT);
+INSERT INTO rpr_ctas VALUES (1, 10), (2, 20), (3, 15), (4, 25);
+
+CREATE TABLE rpr_ctas_result AS
+SELECT id, val, count(*) OVER w AS cnt
+FROM rpr_ctas
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B+)
+    DEFINE A AS TRUE, B AS val > PREV(val)
+);
+SELECT * FROM rpr_ctas_result ORDER BY id;
+
+-- INSERT INTO ... SELECT with RPR
+CREATE TABLE rpr_insert_target (id INT, val INT, cnt BIGINT);
+INSERT INTO rpr_insert_target
+SELECT id, val, count(*) OVER w
+FROM rpr_ctas
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B+)
+    DEFINE A AS TRUE, B AS val > PREV(val)
+);
+SELECT * FROM rpr_insert_target ORDER BY id;
+
+DROP TABLE rpr_ctas_result;
+DROP TABLE rpr_insert_target;
+DROP TABLE rpr_ctas;
+
+-- Prepared statements (tests outfuncs.c / readfuncs.c)
+
+CREATE TABLE rpr_prep (id INT, val INT);
+INSERT INTO rpr_prep VALUES (1, 10), (2, 20), (3, 30);
+
+-- Simple prepared statement
+PREPARE rpr_prep_simple AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_prep
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+EXECUTE rpr_prep_simple;
+EXECUTE rpr_prep_simple;
+
+DEALLOCATE rpr_prep_simple;
+
+-- Prepared statement with parameters
+PREPARE rpr_prep_param(int) AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_prep
+WHERE id <= $1
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 10
+)
+ORDER BY id;
+
+EXECUTE rpr_prep_param(2);
+EXECUTE rpr_prep_param(3);
+
+DEALLOCATE rpr_prep_param;
+
+-- Complex prepared statement
+PREPARE rpr_prep_complex AS
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_prep
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN ((A B){1,2} | C+)
+    DEFINE
+        A AS val > 5,
+        B AS val > 15,
+        C AS val <= 15
+)
+ORDER BY id;
+
+EXECUTE rpr_prep_complex;
+EXECUTE rpr_prep_complex;
+
+DEALLOCATE rpr_prep_complex;
+
+DROP TABLE rpr_prep;
+
+-- CTE and Subquery (tests copyfuncs.c)
+
+CREATE TABLE rpr_copy (id INT, val INT);
+INSERT INTO rpr_copy VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+-- Simple CTE
+WITH rpr_cte AS (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_copy
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+)
+SELECT * FROM rpr_cte ORDER BY id;
+
+-- CTE with multiple references (forces node copy)
+WITH rpr_cte AS (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_copy
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 15
+    )
+)
+SELECT c1.id, c1.cnt as cnt1, c2.cnt as cnt2
+FROM rpr_cte c1
+JOIN rpr_cte c2 ON c1.id = c2.id
+ORDER BY c1.id;
+
+-- Subquery in FROM clause
+SELECT *
+FROM (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_copy
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A B?)
+        DEFINE A AS val > 10, B AS val > 20
+    )
+) sub
+WHERE cnt > 0
+ORDER BY id;
+
+-- Nested subqueries
+SELECT *
+FROM (
+    SELECT *
+    FROM (
+        SELECT id, val, COUNT(*) OVER w as cnt
+        FROM rpr_copy
+        WINDOW w AS (
+            ORDER BY id
+            ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+            PATTERN (A+)
+            DEFINE A AS val >= 10
+        )
+    ) inner_sub
+    WHERE cnt > 0
+) outer_sub
+ORDER BY id;
+
+DROP TABLE rpr_copy;
+
+-- DISTINCT and set operations (tests equalfuncs.c)
+
+CREATE TABLE rpr_equal (id INT, val INT);
+INSERT INTO rpr_equal VALUES (1, 10), (2, 20), (3, 10), (4, 20);
+
+-- DISTINCT with RPR
+SELECT DISTINCT cnt
+FROM (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WINDOW w AS (
+        ORDER BY val
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        AFTER MATCH SKIP TO NEXT ROW
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+) sub
+ORDER BY cnt;
+
+-- UNION with RPR in both sides
+SELECT id, val, cnt FROM (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WHERE val = 10
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+) sub1
+UNION
+SELECT id, val, cnt FROM (
+    SELECT id, val, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WHERE val = 20
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+) sub2
+ORDER BY id;
+
+-- UNION ALL
+SELECT id, cnt FROM (
+    SELECT id, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 10
+    )
+) sub
+UNION ALL
+SELECT id, cnt FROM (
+    SELECT id, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (B+)
+        DEFINE B AS val <= 10
+    )
+) sub
+ORDER BY id, cnt;
+
+-- INTERSECT
+SELECT id, cnt FROM (
+    SELECT id, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WHERE id <= 3
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+) sub1
+INTERSECT
+SELECT id, cnt FROM (
+    SELECT id, COUNT(*) OVER w as cnt
+    FROM rpr_equal
+    WHERE id >= 2
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+) sub2
+ORDER BY id;
+
+DROP TABLE rpr_equal;
+
+-- View with multiple window definitions
+
+CREATE TABLE rpr_multiwin (id INT, val INT);
+INSERT INTO rpr_multiwin VALUES (1, 10), (2, 20), (3, 30);
+
+CREATE VIEW rpr_multiwin_v AS
+SELECT
+    id,
+    val,
+    COUNT(*) OVER w1 as cnt1,
+    COUNT(*) OVER w2 as cnt2
+FROM rpr_multiwin
+WINDOW
+    w1 AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 15
+    ),
+    w2 AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (B*)
+        DEFINE B AS val <= 15
+    );
+
+SELECT * FROM rpr_multiwin_v ORDER BY id;
+SELECT pg_get_viewdef('rpr_multiwin_v'::regclass);
+
+-- {n} quantifier display in view
+CREATE VIEW rpr_quant_n_v AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             INITIAL
+             PATTERN (A{3})
+             DEFINE A AS val > 0);
+SELECT pg_get_viewdef('rpr_quant_n_v'::regclass);
+
+-- {n,} quantifier display in view
+CREATE VIEW rpr_quant_n_plus_v AS
+SELECT id, val, count(*) OVER w
+FROM rpr_serial
+WINDOW w AS (ORDER BY id
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             INITIAL
+             PATTERN (A{2,})
+             DEFINE A AS val > 0);
+SELECT pg_get_viewdef('rpr_quant_n_plus_v'::regclass);
+
+-- ============================================================
+-- Error Cases Tests
+-- ============================================================
+
+
+DROP TABLE IF EXISTS rpr_err;
+CREATE TABLE rpr_err (id INT, val INT);
+INSERT INTO rpr_err VALUES (1, 10), (2, 20);
+
+-- Syntax errors
+
+-- Invalid quantifier syntax
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+!)
+    DEFINE A AS val > 0
+);
+-- Expected: Syntax error
+
+-- Unmatched parentheses
+SET client_min_messages = NOTICE;
+DO $$
+BEGIN
+    EXECUTE 'SELECT COUNT(*) OVER w FROM rpr_err WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING PATTERN ((A B) DEFINE A AS val > 0, B AS val > 10)';
+    RAISE NOTICE 'Unmatched parentheses: UNEXPECTED SUCCESS';
+EXCEPTION
+    WHEN syntax_error THEN
+        RAISE NOTICE 'Unmatched parentheses: EXPECTED ERROR - %', SQLERRM;
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Unmatched parentheses: UNEXPECTED ERROR - %', SQLERRM;
+END $$;
+SET client_min_messages = WARNING;
+
+-- Empty DEFINE
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE
+);
+-- Expected: Syntax error
+
+-- Empty PATTERN
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ()
+    DEFINE A AS val > 0
+);
+-- Expected: Syntax error
+
+-- DEFINE without PATTERN (PATTERN and DEFINE must be used together)
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    DEFINE A AS val > 0
+);
+-- Expected: Syntax error
+
+-- Qualified column references (NOT SUPPORTED)
+
+-- Pattern variable qualified name: not supported (valid per SQL standard 4.16, not yet implemented)
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS A.val > 0
+);
+-- Expected: ERROR: pattern variable qualified column reference "a.val" is not supported
+
+-- PATTERN-only variable qualified name: not supported even without DEFINE entry
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ B+)
+    DEFINE A AS B.val > 0
+);
+-- Expected: ERROR: pattern variable qualified column reference "b.val" is not supported
+
+-- DEFINE-only variable qualified name: still a pattern variable, not a range variable
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0, B AS B.val > 0
+);
+-- Expected: ERROR: pattern variable qualified column reference "b.val" is not supported
+
+-- FROM-clause range variable qualified name: not allowed (prohibited by SQL standard 6.5)
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS rpr_err.val > 0
+);
+-- Expected: ERROR: range variable qualified column reference "rpr_err.val" is not allowed
+
+-- Semantic errors
+
+-- Undefined column in DEFINE
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS nonexistent_column > 0
+);
+-- Expected: ERROR: column "nonexistent_column" does not exist
+
+-- Type mismatch
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 'string'
+);
+-- Expected: ERROR: invalid input syntax for type integer: "string"
+
+-- Aggregate function in DEFINE (if not allowed)
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS COUNT(*) > 0
+);
+-- Expected: ERROR: aggregate functions are not allowed in DEFINE
+
+-- Subquery in DEFINE (NOT SUPPORTED)
+SELECT COUNT(*) OVER w
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > (SELECT max(val) FROM rpr_err)
+);
+-- Expected: ERROR: cannot use subquery in DEFINE expression
+
+-- Edge cases
+
+-- Pattern variable not used (should work, extra vars ignored)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_err
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0, B AS val > 5, C AS val > 10
+)
+ORDER BY id;
+
+DROP TABLE rpr_err;
+
+-- NULL handling
+
+CREATE TABLE rpr_null (id INT, val INT);
+INSERT INTO rpr_null VALUES (1, 10), (2, NULL), (3, 30);
+
+-- NULL in DEFINE expression
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_null
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 15
+)
+ORDER BY id;
+
+-- IS NULL in DEFINE
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_null
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (N+)
+    DEFINE N AS val IS NULL
+)
+ORDER BY id;
+
+-- IS NOT NULL in DEFINE
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_null
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (NN+)
+    DEFINE NN AS val IS NOT NULL
+)
+ORDER BY id;
+
+DROP TABLE rpr_null;
+
+-- Compound navigation: inner nav must be direct arg (not nested in expression)
+SELECT count(*) OVER w
+FROM generate_series(1,10) s(v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS PREV(v + FIRST(v)) > 0
+);
+
+-- FIRST/LAST wrapping FIRST/LAST: prohibited
+SELECT count(*) OVER w
+FROM generate_series(1,10) s(v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS FIRST(FIRST(v)) > 0
+);
+
+-- Triple nesting: prohibited (3-level deep navigation)
+SELECT count(*) OVER w
+FROM generate_series(1,10) s(v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS PREV(FIRST(PREV(v))) > 0
+);
+
+-- ============================================================
+-- Window Deduplication Tests
+-- ============================================================
+
+-- non-RPR and RPR windows with identical base frame are kept separate.
+SELECT id, val,
+    first_value(id) OVER (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    ) AS fv_normal,
+    first_value(id) OVER w1 AS fv_rpr
+FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 40)) AS t(id, val)
+WINDOW w1 AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 10
+);
+
+-- ============================================================
+-- Pattern Optimization Tests
+-- ============================================================
+-- Tests for pattern optimization in optimizer/plan/rpr.c
+-- Use EXPLAIN to verify optimized pattern (shown as "Pattern: ...")
+
+CREATE TABLE rpr_plan (id INT, val INT);
+INSERT INTO rpr_plan VALUES
+    (1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+    (6, 60), (7, 70), (8, 80), (9, 90), (10, 100);
+
+-- Consecutive VAR merge: A A A -> a{3}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A A A) DEFINE A AS val > 0);
+
+-- Consecutive VAR merge: A{2} A{3} -> a{5}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A{2} A{3}) DEFINE A AS val > 0);
+
+-- Consecutive VAR merge: A+ A* -> a+
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A+ A*) DEFINE A AS val > 0);
+
+-- Consecutive VAR merge: A A+ -> a{2,}
+-- Tests line 251: child->max == RPR_QUANTITY_INF branch in mergeConsecutiveVars
+-- prev: A{1,1} (finite), child: A+ (infinite) triggers line 251 evaluation
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A A+) DEFINE A AS val > 0);
+
+-- Consecutive GROUP merge with finite quantifiers: ((A B){5}) ((A B){10}) -> merged
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (((A B){5}) ((A B){10})) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Consecutive GROUP merge with unbounded: (A B)+ (A B)+ -> (a b){2,}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)+ (A B)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Consecutive GROUP merge: (A B){2} (A B)+ -> (a b){3,}
+-- Tests line 325: child->max == RPR_QUANTITY_INF branch in mergeConsecutiveGroups
+-- prev: (A B){2,2} (finite), child: (A B)+ (infinite) triggers line 325 evaluation
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B){2} (A B)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- PREFIX merge: A B (A B)+ -> (a b){2,}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B (A B)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- PREFIX and SUFFIX merge: A B (A B)+ A B -> (a b){3,}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B (A B)+ A B) DEFINE A AS val <= 40, B AS val > 40);
+
+-- Flatten nested: A ((B) (C)) -> a b c
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A ((B) (C))) DEFINE A AS val <= 30, B AS val <= 60, C AS val > 60);
+
+-- Data execution: SEQ flatten produces correct results
+SELECT id, val, count(*) OVER w AS cnt
+FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP TO NEXT ROW
+             PATTERN (A ((B) (C))) DEFINE A AS val <= 30, B AS val <= 60, C AS val > 60);
+
+-- ALT flatten: (A | (B | C))+ -> (a | b | c)+
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A | (B | C))+) DEFINE A AS val <= 30, B AS val <= 60, C AS val > 60);
+
+-- ALT deduplicate: (A | B | A) -> (a | b)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A | B | A)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Data execution: ALT dedup produces correct results
+SELECT id, val, count(*) OVER w AS cnt
+FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW
+             PATTERN ((A | B | A)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Quantifier multiply: (A{2}){3} -> a{6}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2}){3}) DEFINE A AS val > 0);
+
+-- Quantifier multiply with child range: (A{2,3}){3} -> a{6,9}
+-- outer exact, child range - optimization applies
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2,3}){3}) DEFINE A AS val > 0);
+
+-- Quantifier NO multiply: (A{2}){2,3} stays as (a{2}){2,3}
+-- outer range - gaps would occur (4,6 not 4,5,6), no optimization
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2}){2,3}) DEFINE A AS val > 0);
+
+-- Quantifier NO multiply: (A{2}){2,} stays as (a{2}){2,}
+-- outer unbounded - gaps would occur (4,6,8,... not 4,5,6,...), no optimization
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2}){2,}) DEFINE A AS val > 0);
+
+-- Quantifier multiply: (A){2,} -> a{2,}
+-- child exact 1 - no gaps, optimization applies
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A){2,}) DEFINE A AS val > 0);
+
+-- Quantifier multiply: (A)+ -> a+
+-- child exact 1 - no gaps, optimization applies
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A)+) DEFINE A AS val > 0);
+
+-- Quantifier NO multiply: (A{2}){3,5} stays as (a{2}){3,5}
+-- outer range, child exact > 1 - gaps would occur (6,8,10 not 6,7,8,9,10)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2}){3,5}) DEFINE A AS val > 0);
+
+-- Quantifier NO multiply: (A{2,3}){2,3} stays as (a{2,3}){2,3}
+-- outer range, child range - gaps possible (e.g., (A{4,5}){2,3} misses 11)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2,3}){2,3}) DEFINE A AS val > 0);
+
+-- Nested unbounded: (A*)* -> a*
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A*)*) DEFINE A AS val > 0);
+
+-- Nested unbounded: (A+)* -> a*
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A+)*) DEFINE A AS val > 0);
+
+-- Nested unbounded: (A+)+ -> a+
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A+)+) DEFINE A AS val > 0);
+
+-- Unwrap GROUP{1,1}: (A) -> a
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A)) DEFINE A AS val > 0);
+
+-- Unwrap GROUP{1,1}: (A B) -> a b
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Combined optimization: A A (B B)+ B B C C C -> a{2} (b{2}){2,} c{3}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A A (B B)+ B B C C C)
+             DEFINE A AS val <= 20, B AS val > 20 AND val <= 70, C AS val > 70);
+
+-- Consecutive GROUP merge with unbounded: (A+) (A+) -> a{2,}
+-- Tests mergeConsecutiveGroups with child->max == INF
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A+) (A+)) DEFINE A AS val > 0);
+
+-- Consecutive GROUP merge finite: (A{10}){20} -> a{200}
+-- Tests mergeConsecutiveGroups with both finite
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{10}){20}) DEFINE A AS val > 0);
+
+-- Different GROUP prevents merge: (A B){2} (C D){3}
+-- Tests mergeConsecutiveGroups flush previous
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B){2} (C D){3})
+             DEFINE A AS val <= 25, B AS val > 25 AND val <= 50,
+                    C AS val > 50 AND val <= 75, D AS val > 75);
+
+-- Different children count prevents merge: (A B)+ (A B C)+
+-- Tests rprPatternChildrenEqual length check
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)+ (A B C)+)
+             DEFINE A AS val <= 33, B AS val > 33 AND val <= 66, C AS val > 66);
+
+-- PREFIX only merge: A B (A B)+ -> (a b){2,}
+-- Tests mergeGroupPrefixSuffix: absorb preceding elements into GROUP min
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B (A B)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- SUFFIX only merge: (A B)+ A B -> (a b){2,}
+-- Tests mergeGroupPrefixSuffix: absorb following elements into GROUP min
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)+ A B) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Multiple SUFFIX absorption with skipUntil: (A B)+ A B A B C
+-- Tests mergeGroupPrefixSuffix: skip absorbed suffix elements
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)+ A B A B C)
+             DEFINE A AS val <= 50, B AS val > 50 AND val <= 75, C AS val > 75);
+
+-- PREFIX merge with remaining prefix: A B C D (C D)+
+-- Tests mergeGroupPrefixSuffix: trimmed list reconstruction
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B C D (C D)+)
+             DEFINE A AS val <= 25, B AS val > 25 AND val <= 50,
+                    C AS val > 50 AND val <= 75, D AS val > 75);
+
+-- PREFIX merge with quantifiers: A B* (A B*)+ -> (a b*){2,}
+-- Tests mergeGroupPrefixSuffix: quantifier comparison in rprPatternEqual
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B* (A B*)+)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- PREFIX merge with multiple quantifiers: A+ B* C? (A+ B* C?)+ -> (a+ b* c?){2,}
+-- Tests mergeGroupPrefixSuffix: complex quantifier patterns
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A+ B* C? (A+ B* C?)+)
+             DEFINE A AS val <= 30, B AS val > 30 AND val <= 60, C AS val > 60);
+
+-- SUFFIX merge with quantifiers: (A B*)+ A B* -> (a b*){2,}
+-- Tests mergeGroupPrefixSuffix: suffix with quantifiers
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B*)+ A B*)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Unwrap GROUP{1,1}: ((A | B | C)) -> (a | b | c)
+-- Tests tryUnwrapGroup removing redundant outer GROUP
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A | B | C)) DEFINE A AS val <= 30, B AS val <= 60, C AS val > 60);
+
+-- Data execution: GROUP unwrap produces correct results
+SELECT id, val, count(*) OVER w AS cnt
+FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP TO NEXT ROW
+             PATTERN ((A | B | C)) DEFINE A AS val <= 30, B AS val <= 60, C AS val > 60);
+
+-- Reluctant optimization bypass: VAR merge
+-- A+? A stays as a+? a (greedy A+ A merges to a{2,})
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A+? A) DEFINE A AS val > 0);
+
+-- Reluctant optimization bypass: GROUP merge
+-- (A B)+? (A B) stays separate (greedy merges to (a b){2,})
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)+? (A B)) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Reluctant optimization bypass: quantifier multiply (outer reluctant)
+-- (A{2}){3}? stays as (a{2}){3}? (greedy merges to a{6})
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2}){3}?) DEFINE A AS val > 0);
+
+-- Reluctant optimization bypass: quantifier multiply (inner reluctant)
+-- (A{2}?){3} stays as (a{2}?){3} (greedy merges to a{6})
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A{2}?){3}) DEFINE A AS val > 0);
+
+-- Reluctant optimization bypass: PREFIX merge
+-- A B (A B)+? stays separate (greedy merges to (a b){2,})
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B (A B)+?) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Reluctant optimization bypass: SUFFIX merge
+-- (A B)+? A B stays separate (greedy merges to (a b){2,})
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A B)+? A B) DEFINE A AS val <= 50, B AS val > 50);
+
+-- GROUP unwrap with quantifier propagation: (A)?? B -> a?? b
+-- Single VAR child {1,1} receives GROUP's quantifier and reluctant
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A)?? B) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Reluctant preserved through ALT flatten
+-- (A | (B | C))+? flattens to (a | b | c)+? - inner ALT flattened, reluctant kept
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A | (B | C))+?) DEFINE A AS val <= 30, B AS val <= 60, C AS val > 60);
+
+-- Reluctant optimization bypass: absorption flags
+-- A+? with SKIP PAST LAST ROW - no absorption markers (greedy A+ gets a+")
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A+?) DEFINE A AS val > 0);
+
+-- Duplicate GROUP removal: ((A | B)+ | (A | B)+) -> (a | b)+
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A | B)+ | (A | B)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Consecutive VAR merge with zero-min: A* A+ -> a+
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A* A+) DEFINE A AS val > 0);
+
+-- Consecutive VAR merge (4-element): A A{2} A+ A{3} -> a{7,}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A A{2} A+ A{3}) DEFINE A AS val > 0);
+
+-- PREFIX+SUFFIX merge (5-way): A B A B (A B)+ A B A B -> (a b){5,}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (A B A B (A B)+ A B A B)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Unwrap single-item ALT after dedup: (A | A)+ -> a+
+-- ALT dedup reduces to single-item, then GROUP unwrap
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN ((A | A)+) DEFINE A AS val > 0);
+
+-- GROUP{1,1} to SEQ with flatten: ((A B)(C D)) -> a b c d
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (((A B)(C D)))
+             DEFINE A AS val <= 25, B AS val > 25 AND val <= 50,
+                    C AS val > 50 AND val <= 75, D AS val > 75);
+
+-- Nested ALT pattern: ((A B) | C) D | A B C
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (((A B) | C) D | A B C)
+             DEFINE A AS val <= 25, B AS val > 25 AND val <= 50,
+                    C AS val > 50 AND val <= 75, D AS val > 75);
+
+-- Nested ALT with unbounded: ((A+ B) | C) D | A B C
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             PATTERN (((A+ B) | C) D | A B C)
+             DEFINE A AS val <= 25, B AS val > 25 AND val <= 50,
+                    C AS val > 50 AND val <= 75, D AS val > 75);
+
+-- ============================================================
+-- Absorption Flag Display Tests
+-- ============================================================
+-- Tests absorption marker display in EXPLAIN output
+-- Markers: ' = branch element, " = judgment point
+-- Files: explain.c (append_rpr_quantifier, deparse_rpr_pattern)
+
+-- Simple VAR: A+ -> a+" (judgment point)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A+) DEFINE A AS val > 0);
+
+-- GROUP unbounded: (A B)+ -> (a' b')+" (branch + judgment)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A B)+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- ALT both absorbable: A+ | B+ -> (a+" | b+")
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A+ | B+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- ALT one absorbable: A+ | B -> (a+" | b)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A+ | B) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Sequence with absorbable start: A+ B -> a+" b
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A+ B) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Complex nested: ((A+ B) | C) D | A B C - deeply nested ALT
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (((A+ B) | C) D | A B C)
+             DEFINE A AS val <= 30, B AS val <= 60, C AS val <= 80, D AS val > 80);
+
+-- Nested unbounded: (A+ | B)+ -> (a+" | b)+ (first iteration absorbable)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A+ | B)+)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- ALT inside unbounded GROUP: (A+ B | A B)* -> (a+" b | a b)* (first iteration absorbable)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A+ B | A B)*)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Fixed-length group absorbable: (A{2} B{3})+ -> (a{2}' b{3}'){2,}"
+-- All children have min == max, equivalent to unrolling to {1,1}
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A{2} B{3})+)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Nested fixed-length group: (A (B C){2} D)+ -> absorbable
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A (B C){2} D)+)
+             DEFINE A AS val <= 20, B AS val <= 40, C AS val <= 60, D AS val > 60);
+
+-- Nested fixed-length with inner quantifier: ((A{2} B{3}){2})+ -> absorbable
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (((A{2} B{3}){2})+)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Non-absorbable fixed-length: (A B{2,5})+ -> no markers (min != max)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A B{2,5})+)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Non-absorbable fixed-length: (A B?)+ -> no markers (min != max)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A B?)+)
+             DEFINE A AS val <= 50, B AS val > 50);
+
+-- Non-absorbable (unbounded not at start): A B+ -> a b+ (no markers)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A B+) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Non-absorbable (no unbounded branch): (A | B){2,} -> (a | b){2,} (no markers)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN ((A | B){2,}) DEFINE A AS val <= 50, B AS val > 50);
+
+-- Non-absorbable (SKIP TO NEXT ROW): A+ -> a+ (no markers)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+             AFTER MATCH SKIP TO NEXT ROW PATTERN (A+) DEFINE A AS val > 0);
+
+-- Non-absorbable (limited frame): A+ -> a+ (no markers)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_plan
+WINDOW w AS (ORDER BY id ROWS BETWEEN CURRENT ROW AND 10 FOLLOWING
+             AFTER MATCH SKIP PAST LAST ROW PATTERN (A+) DEFINE A AS val > 0);
+
+-- Reluctant {1}? quantifier deparse
+-- A{1}? is a reluctant {1,1} quantifier.  The deparse code must
+-- output "{1}" explicitly to disambiguate from a bare "?" quantifier
+-- (which would mean {0,1}).
+EXPLAIN (COSTS OFF) SELECT count(*) OVER w
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY val
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{1}? B)
+    DEFINE A AS val > 0, B AS val > 0
+);
+
+-- ============================================================
+-- Absorption Analysis Tests
+-- ============================================================
+-- Tests context absorption optimization (O(n^2) -> O(n))
+-- Files: rpr.c (computeAbsorbability)
+
+-- Simple Absorbable Pattern: A+ B
+-- Pattern starts with unbounded VAR
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B)
+    DEFINE A AS val <= 50, B AS val > 50
+)
+ORDER BY id;
+
+-- Absorbable GROUP Pattern: (A B)+ C
+-- Pattern starts with unbounded GROUP
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A B)+ C)
+    DEFINE A AS val <= 30, B AS val > 30 AND val <= 60, C AS val > 60
+)
+ORDER BY id;
+
+-- Non-Absorbable: Unbounded Not at Start
+-- Pattern: A B+ (unbounded not at start)
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B+)
+    DEFINE A AS val <= 50, B AS val > 50
+)
+ORDER BY id;
+
+-- ALT with Absorbable Branches
+-- Pattern: (A+ | B+) C - both branches absorbable
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A+ | B+) C)
+    DEFINE A AS val <= 30, B AS val > 30 AND val <= 60, C AS val > 60
+)
+ORDER BY id;
+
+-- ALT with Mixed Branches
+-- Pattern: (A+ | B C) - only first branch absorbable
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A+ | B C)+)
+    DEFINE A AS val <= 30, B AS val > 30 AND val <= 60, C AS val > 60
+)
+ORDER BY id;
+
+-- Non-Absorbable: ALT Inside GROUP
+-- Pattern: (A | B){2,} - ALT inside unbounded GROUP
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A | B){2,})
+    DEFINE A AS val <= 50, B AS val > 50
+)
+ORDER BY id;
+
+-- Non-Absorbable: Nested Unbounded
+-- Pattern: ((A B)+ C)+ - nested GROUP structure
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (((A B)+ C)+)
+    DEFINE A AS val <= 30, B AS val > 30 AND val <= 60, C AS val > 60
+)
+ORDER BY id;
+
+-- Non-Absorbable: Unbounded Element Inside GROUP
+-- Pattern: (A B+){2,} - unbounded inside GROUP
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A B+){2,})
+    DEFINE A AS val <= 50, B AS val > 50
+)
+ORDER BY id;
+
+-- Runtime Conditions: SKIP TO NEXT ROW
+-- Absorption disabled with SKIP TO NEXT ROW
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP TO NEXT ROW
+    PATTERN (A+ B)
+    DEFINE A AS val <= 50, B AS val > 50
+)
+ORDER BY id;
+
+-- Runtime Conditions: Limited Frame
+-- Absorption disabled with limited frame end
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND 5 FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A+ B)
+    DEFINE A AS val <= 50, B AS val > 50
+)
+ORDER BY id;
+
+-- ============================================================
+-- Edge Case Tests
+-- ============================================================
+-- Tests boundary conditions and complex scenarios
+
+-- Empty Match Prevention
+-- Pattern that could match empty: A*
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A*)
+    DEFINE A AS val > 1000  -- Never matches
+)
+ORDER BY id;
+
+-- All Rows Match
+-- Pattern where every row matches
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val >= 0  -- Always true
+)
+ORDER BY id;
+
+-- Large Quantifiers
+-- Pattern: A{100} (large exact quantifier)
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{100})
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Pattern: A{10,20} (large range quantifier)
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{10,20})
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Complex Multi-Level Nesting
+-- Pattern: (((A B) | C)+ D)+
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((((A B) | C)+ D)+)
+    DEFINE A AS val <= 20, B AS val > 20 AND val <= 40,
+           C AS val > 40 AND val <= 60, D AS val > 60
+)
+ORDER BY id;
+
+-- Long Alternation Chain
+-- Pattern: A | B | C | D | E (5-way ALT)
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A | B | C | D | E)
+    DEFINE A AS val = 10, B AS val = 30, C AS val = 50,
+           D AS val = 70, E AS val = 90
+)
+ORDER BY id;
+
+-- Long Sequence
+-- Pattern: A B C D E F G H (8-element SEQ)
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B C D E F G H)
+    DEFINE A AS val >= 10, B AS val >= 20, C AS val >= 30,
+           D AS val >= 40, E AS val >= 50, F AS val >= 60,
+           G AS val >= 70, H AS val >= 80
+)
+ORDER BY id;
+
+-- Interleaved Quantifiers
+-- Pattern: A{2} B+ C{3,5} D* E{1,}
+
+SELECT id, val, COUNT(*) OVER w as cnt
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A{2} B+ C{3,5} D* E{1,})
+    DEFINE A AS val > 0, B AS val > 0, C AS val > 0,
+           D AS val > 0, E AS val > 0
+)
+ORDER BY id;
+
+-- ============================================================
+-- Optimization Fallback Tests
+-- ============================================================
+-- Tests for optimization edge cases and fallback behavior
+
+CREATE TABLE rpr_fallback (id INT, val INT);
+INSERT INTO rpr_fallback VALUES (1, 10), (2, 20);
+
+-- Test: min quantifier overflow causes optimization fallback (min == max case)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_fallback
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A{2000000000}){2})
+    DEFINE A AS val > 0
+);
+-- Expected: Fallback - pattern not merged due to min overflow (4000000000 > INT32_MAX)
+
+-- Test: max-only quantifier overflow causes optimization fallback
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_fallback
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A{1,2000000000}){2})
+    DEFINE A AS val > 0
+);
+-- Expected: Fallback - min OK (2*1=2), but max overflow (2*2000000000 > INT32_MAX)
+
+-- Test: max quantifier exceeds valid range (2147483647 = INT_MAX, limit is 2147483646)
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_fallback
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A{2000000000,2147483647}){2})
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR at parse time before optimization
+
+-- Test: nested unbounded with large min causes overflow fallback
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_fallback
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((A{2000000000,}){2000000000,})
+    DEFINE A AS val > 0
+);
+-- Expected: Fallback - min overflow (2000000000 * 2000000000 > INT32_MAX)
+
+-- Test: prefix mismatch causes optimization fallback
+EXPLAIN (COSTS OFF)
+SELECT COUNT(*) OVER w FROM rpr_fallback
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A B (C D)+)
+    DEFINE A AS val > 0, B AS val > 5, C AS val > 10, D AS val > 15
+);
+-- Expected: Fallback - prefix elements don't match GROUP content
+
+DROP TABLE rpr_fallback;
+
+-- ============================================================
+-- Planner Integration Tests
+-- ============================================================
+-- Tests full planning pipeline and WindowAgg plan node creation
+-- Files: planner.c, createplan.c
+
+CREATE TABLE rpr_planner (id INT, category VARCHAR(10), val INT);
+INSERT INTO rpr_planner VALUES
+    (1, 'A', 10), (2, 'A', 20), (3, 'A', 30),
+    (4, 'B', 40), (5, 'B', 50), (6, 'B', 60),
+    (7, 'C', 70), (8, 'C', 80), (9, 'C', 90);
+
+-- Multiple Window Functions in Same Query
+SELECT id, category, val,
+       COUNT(*) OVER w1 as cnt1,
+       COUNT(*) OVER w2 as cnt2
+FROM rpr_planner
+WINDOW w1 AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+),
+w2 AS (
+    PARTITION BY category
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (B+)
+    DEFINE B AS val >= 40
+)
+ORDER BY id;
+
+-- Window Function with PARTITION BY
+
+SELECT id, category, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_planner
+WINDOW w AS (
+    PARTITION BY category
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY category, id;
+
+-- Window Function with Complex ORDER BY
+
+SELECT id, category, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_planner
+WINDOW w AS (
+    ORDER BY category DESC, val ASC
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY category DESC, val ASC;
+
+-- Named Window Reference
+
+SELECT id, category, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_planner
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Inline Window Definition
+
+SELECT id, category, val,
+       COUNT(*) OVER (
+           ORDER BY id
+           ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+           PATTERN (A+)
+           DEFINE A AS val > 0
+       ) as cnt
+FROM rpr_planner
+ORDER BY id;
+
+-- Window with Aggregate Functions
+SELECT category,
+       COUNT(*) OVER w as window_cnt,
+       COUNT(*) as agg_cnt
+FROM rpr_planner
+WINDOW w AS (
+    PARTITION BY category
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+GROUP BY category
+ORDER BY category;
+-- Expected: ERROR: syntax error at or near "GROUP"
+-- (GROUP BY after WINDOW clause is not valid SQL syntax)
+
+-- ============================================================
+-- Subquery and CTE Tests
+-- Files: planner.c, prepjointree.c
+-- ============================================================
+-- Tests RPR with subqueries and CTEs
+
+-- RPR in Subquery (FROM clause)
+
+SELECT * FROM (
+    SELECT id, category, val,
+           COUNT(*) OVER w as cnt
+    FROM rpr_planner
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+) sub
+WHERE cnt > 5
+ORDER BY id;
+
+-- RPR with Subquery in WHERE
+
+SELECT id, category, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_planner
+WHERE val > (SELECT AVG(val) FROM rpr_planner)
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 50
+)
+ORDER BY id;
+
+-- CTE with RPR
+
+WITH rpr_cte AS (
+    SELECT id, category, val,
+           COUNT(*) OVER w as cnt
+    FROM rpr_planner
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+)
+SELECT * FROM rpr_cte WHERE cnt > 5 ORDER BY id;
+
+-- Multiple CTE References
+
+WITH rpr_cte AS (
+    SELECT id, category, val,
+           COUNT(*) OVER w as cnt
+    FROM rpr_planner
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+)
+SELECT c1.id, c1.cnt, c2.cnt as cnt2
+FROM rpr_cte c1
+JOIN rpr_cte c2 ON c1.id = c2.id
+ORDER BY c1.id;
+
+-- Nested CTEs
+
+WITH cte1 AS (
+    SELECT id, category, val FROM rpr_planner WHERE val > 30
+),
+cte2 AS (
+    SELECT id, category, val,
+           COUNT(*) OVER w as cnt
+    FROM cte1
+    WINDOW w AS (
+        ORDER BY id
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS val > 0
+    )
+)
+SELECT * FROM cte2 ORDER BY id;
+
+-- ============================================================
+-- JOIN Tests
+-- Files: prepjointree.c, setrefs.c
+-- ============================================================
+-- Tests RPR with JOINs and multiple table references
+
+CREATE TABLE rpr_join1 (id INT, val1 INT);
+CREATE TABLE rpr_join2 (id INT, val2 INT);
+
+INSERT INTO rpr_join1 VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+INSERT INTO rpr_join2 VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500);
+
+-- RPR After INNER JOIN
+
+SELECT t1.id, t1.val1, t2.val2,
+       COUNT(*) OVER w as cnt
+FROM rpr_join1 t1
+INNER JOIN rpr_join2 t2 ON t1.id = t2.id
+WINDOW w AS (
+    ORDER BY t1.id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val1 + val2 > 100
+)
+ORDER BY t1.id;
+
+-- RPR After LEFT JOIN
+
+SELECT t1.id, t1.val1, t2.val2,
+       COUNT(*) OVER w as cnt
+FROM rpr_join1 t1
+LEFT JOIN rpr_join2 t2 ON t1.id = t2.id
+WINDOW w AS (
+    ORDER BY t1.id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val1 > 0
+)
+ORDER BY t1.id;
+
+-- RPR with Multiple Tables in DEFINE
+
+SELECT t1.id, t1.val1, t2.val2,
+       COUNT(*) OVER w as cnt
+FROM rpr_join1 t1
+INNER JOIN rpr_join2 t2 ON t1.id = t2.id
+WINDOW w AS (
+    ORDER BY t1.id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ B)
+    DEFINE A AS val1 > 20,
+           B AS val2 > 200
+)
+ORDER BY t1.id;
+
+-- RPR After Cross Join
+
+SELECT t1.id as id1, t2.id as id2, t1.val1, t2.val2,
+       COUNT(*) OVER w as cnt
+FROM rpr_join1 t1
+CROSS JOIN rpr_join2 t2
+WHERE t1.id <= 2 AND t2.id <= 2
+WINDOW w AS (
+    ORDER BY t1.id, t2.id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val1 + val2 > 0
+)
+ORDER BY t1.id, t2.id;
+
+-- Self-Join with RPR
+
+SELECT id, val1, val1_next,
+       COUNT(*) OVER w as cnt
+FROM (SELECT a.id, a.val1, b.val1 as val1_next
+      FROM rpr_join1 a
+      INNER JOIN rpr_join1 b ON a.id + 1 = b.id) sub
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (X+)
+    DEFINE X AS val1 < val1_next
+)
+ORDER BY id;
+
+DROP TABLE rpr_join1, rpr_join2;
+
+-- ============================================================
+-- Complex Expression Tests
+-- Files: createplan.c, setrefs.c
+-- ============================================================
+-- Tests complex target list expressions
+
+CREATE TABLE rpr_target (id INT, val INT);
+INSERT INTO rpr_target VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+-- Expressions in Target List
+
+SELECT id,
+       val * 2 as doubled,
+       val + 10 as added,
+       COUNT(*) OVER w as cnt
+FROM rpr_target
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- CASE Expression in Target List
+
+SELECT id, val,
+       CASE
+           WHEN val < 30 THEN 'low'
+           WHEN val < 50 THEN 'medium'
+           ELSE 'high'
+       END as category,
+       COUNT(*) OVER w as cnt
+FROM rpr_target
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Subquery in Target List
+
+SELECT id, val,
+       (SELECT MAX(val) FROM rpr_target) as max_val,
+       COUNT(*) OVER w as cnt
+FROM rpr_target
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Function Calls in Target List
+
+SELECT id, val,
+       COALESCE(val, 0) as coalesced,
+       ABS(val - 30) as distance,
+       COUNT(*) OVER w as cnt
+FROM rpr_target
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Column Aliases and References
+
+SELECT id as row_id,
+       val as value,
+       COUNT(*) OVER w as cnt
+FROM rpr_target
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY row_id;
+
+DROP TABLE rpr_target;
+
+-- ============================================================
+-- Set Operations Tests
+-- Files: planner.c
+-- ============================================================
+-- Tests RPR with UNION, INTERSECT, EXCEPT
+
+CREATE TABLE rpr_set1 (id INT, val INT);
+CREATE TABLE rpr_set2 (id INT, val INT);
+
+INSERT INTO rpr_set1 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO rpr_set2 VALUES (2, 20), (3, 30), (4, 40);
+
+-- UNION with RPR
+
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set1
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+UNION
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set2
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+ORDER BY id;
+
+-- UNION ALL with RPR
+
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set1
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+UNION ALL
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set2
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+ORDER BY id, val;
+
+-- INTERSECT with RPR
+
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set1
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+INTERSECT
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set2
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+ORDER BY id;
+
+-- EXCEPT with RPR
+
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set1
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+EXCEPT
+(SELECT id, val, COUNT(*) OVER w as cnt
+ FROM rpr_set2
+ WINDOW w AS (
+     ORDER BY id
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+     PATTERN (A+)
+     DEFINE A AS val > 0
+ ))
+ORDER BY id;
+
+DROP TABLE rpr_set1, rpr_set2;
+
+-- ============================================================
+-- Sorting and Grouping Tests
+-- Files: planner.c, createplan.c
+-- ============================================================
+-- Tests RPR interaction with sorting and grouping
+
+CREATE TABLE rpr_sort (id INT, category VARCHAR(10), val INT);
+INSERT INTO rpr_sort VALUES
+    (1, 'A', 30), (2, 'B', 20), (3, 'A', 10),
+    (4, 'B', 40), (5, 'A', 50), (6, 'B', 60);
+
+-- RPR with GROUP BY (aggregate in DEFINE -> ERROR before GROUP BY interaction)
+-- Expected: ERROR: aggregate functions are not allowed in DEFINE
+
+SELECT category,
+       COUNT(*) as group_cnt,
+       MAX(val) as max_val,
+       COUNT(*) OVER w as window_cnt
+FROM rpr_sort
+GROUP BY category
+WINDOW w AS (
+    ORDER BY category
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS COUNT(*) > 0
+)
+ORDER BY category;
+
+-- RPR with HAVING (same aggregate-in-DEFINE error)
+-- Expected: ERROR: aggregate functions are not allowed in DEFINE
+
+SELECT category,
+       COUNT(*) as group_cnt,
+       COUNT(*) OVER w as window_cnt
+FROM rpr_sort
+GROUP BY category
+HAVING COUNT(*) > 2
+WINDOW w AS (
+    ORDER BY category
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS COUNT(*) > 0
+)
+ORDER BY category;
+
+-- RPR with DISTINCT
+
+SELECT DISTINCT category,
+       COUNT(*) OVER w as cnt
+FROM rpr_sort
+WINDOW w AS (
+    PARTITION BY category
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY category;
+
+-- RPR with ORDER BY (different from window ORDER BY)
+
+SELECT id, category, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_sort
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY val DESC;
+
+-- RPR with LIMIT and OFFSET
+
+SELECT id, category, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_sort
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id
+LIMIT 3 OFFSET 1;
+
+DROP TABLE rpr_sort;
+
+-- SQL function inlining: $1 in DEFINE must be substituted by
+-- substitute_actual_parameters_in_from via query_tree_mutator.
+CREATE TABLE rpr_srf_t (v int);
+INSERT INTO rpr_srf_t SELECT generate_series(1, 5);
+
+CREATE FUNCTION rpr_srf_f(threshold int)
+RETURNS TABLE (v int, cnt bigint)
+LANGUAGE sql STABLE AS $$
+    SELECT v::int, count(*) OVER w
+    FROM rpr_srf_t
+    WINDOW w AS (
+        ORDER BY v
+        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+        PATTERN (A+)
+        DEFINE A AS v > $1
+    )
+$$;
+
+SELECT v, cnt FROM rpr_srf_f(3) ORDER BY v;
+
+DROP TABLE rpr_srf_t;
+DROP FUNCTION rpr_srf_f(int);
+
+DROP TABLE rpr_planner;
+
+-- ============================================================
+-- Stress Tests
+-- ============================================================
+-- Edge cases and stress scenarios
+
+CREATE TABLE rpr_stress (id INT, val INT);
+INSERT INTO rpr_stress SELECT i, i * 10 FROM generate_series(1, 20) i;
+
+-- Very Long Query with Many Windows
+SELECT id, val,
+       COUNT(*) OVER w1 as cnt1,
+       COUNT(*) OVER w2 as cnt2,
+       COUNT(*) OVER w3 as cnt3
+FROM rpr_stress
+WINDOW w1 AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+),
+w2 AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (B+)
+    DEFINE B AS val > 50
+),
+w3 AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (C+)
+    DEFINE C AS val > 100
+)
+ORDER BY id;
+
+-- Deeply Nested Subqueries with RPR
+
+SELECT * FROM (
+    SELECT * FROM (
+        SELECT * FROM (
+            SELECT id, val,
+                   COUNT(*) OVER w as cnt
+            FROM rpr_stress
+            WINDOW w AS (
+                ORDER BY id
+                ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+                PATTERN (A+)
+                DEFINE A AS val > 0
+            )
+        ) sub1
+    ) sub2
+) sub3
+WHERE cnt > 10
+ORDER BY id;
+
+-- Complex Expression in DEFINE Clause
+
+SELECT id, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_stress
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+ B)
+    DEFINE A AS (val % 3 = 0 OR val % 5 = 0),
+           B AS (val * 2 > 100 AND val / 2 < 100)
+)
+ORDER BY id;
+
+-- Window with No Matching Rows
+
+SELECT id, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_stress
+WHERE val > 1000  -- No rows match
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+-- Window on Single Row
+
+SELECT id, val,
+       COUNT(*) OVER w as cnt
+FROM rpr_stress
+WHERE id = 10
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A+)
+    DEFINE A AS val > 0
+)
+ORDER BY id;
+
+DROP TABLE rpr_stress;
+
+-- ============================================================
+-- Error Limit Tests
+-- ============================================================
+-- Tests for error conditions in rpr.c
+
+CREATE TABLE rpr_errors (id INT, val INT);
+INSERT INTO rpr_errors VALUES (1, 10), (2, 20);
+
+-- Test: DEFINE variable not in PATTERN (error)
+SELECT id, val, COUNT(*) OVER w FROM rpr_errors
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (A)
+    DEFINE
+      B AS TRUE
+);
+-- Expected: Error - B is not used in PATTERN
+
+-- Test: 251 variables in PATTERN and DEFINE (boundary - should succeed)
+SELECT COUNT(*) OVER w FROM rpr_errors
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (V1 V2 V3 V4 V5 V6 V7 V8 V9 V10 V11 V12 V13 V14 V15 V16 V17 V18 V19 V20 V21 V22 V23 V24 V25 V26 V27 V28 V29 V30 V31 V32 V33 V34 V35 V36 V37 V38 V39 V40 V41 V42 V43 V44 V45 V46 V47 V48 V49 V50 V51 V52 V53 V54 V55 V56 V57 V58 V59 V60 V61 V62 V63 V64 V65 V66 V67 V68 V69 V70 V71 V72 V73 V74 V75 V76 V77 V78 V79 V80 V81 V82 V83 V84 V85 V86 V87 V88 V89 V90 V91 V92 V93 V94 V95 V96 V97 V98 V99 V100 V101 V102 V103 V104 V105 V106 V107 V108 V109 V110 V111 V112 V113 V114 V115 V116 V117 V118 V119 V120 V121 V122 V123 V124 V125 V126 V127 V128 V129 V130 V131 V132 V133 V134 V135 V136 V137 V138 V139 V140 V141 V142 V143 V144 V145 V146 V147 V148 V149 V150 V151 V152 V153 V154 V155 V156 V157 V158 V159 V160 V161 V162 V163 V164 V165 V166 V167 V168 V169 V170 V171 V172 V173 V174 V175 V176 V177 V178 V179 V180 V181 V182 V183 V184 V185 V186 V187 V188 V189 V190 V191 V192 V193 V194 V195 V196 V197 V198 V199 V200 V201 V202 V203 V204 V205 V206 V207 V208 V209 V210 V211 V212 V213 V214 V215 V216 V217 V218 V219 V220 V221 V222 V223 V224 V225 V226 V227 V228 V229 V230 V231 V232 V233 V234 V235 V236 V237 V238 V239 V240 V241 V242 V243 V244 V245 V246 V247 V248 V249 V250 V251)
+    DEFINE
+    V1 AS val > 0, V2 AS val > 0, V3 AS val > 0, V4 AS val > 0, V5 AS val > 0, V6 AS val > 0, V7 AS val > 0, V8 AS val > 0, V9 AS val > 0, V10 AS val > 0,
+    V11 AS val > 0, V12 AS val > 0, V13 AS val > 0, V14 AS val > 0, V15 AS val > 0, V16 AS val > 0, V17 AS val > 0, V18 AS val > 0, V19 AS val > 0, V20 AS val > 0,
+    V21 AS val > 0, V22 AS val > 0, V23 AS val > 0, V24 AS val > 0, V25 AS val > 0, V26 AS val > 0, V27 AS val > 0, V28 AS val > 0, V29 AS val > 0, V30 AS val > 0,
+    V31 AS val > 0, V32 AS val > 0, V33 AS val > 0, V34 AS val > 0, V35 AS val > 0, V36 AS val > 0, V37 AS val > 0, V38 AS val > 0, V39 AS val > 0, V40 AS val > 0,
+    V41 AS val > 0, V42 AS val > 0, V43 AS val > 0, V44 AS val > 0, V45 AS val > 0, V46 AS val > 0, V47 AS val > 0, V48 AS val > 0, V49 AS val > 0, V50 AS val > 0,
+    V51 AS val > 0, V52 AS val > 0, V53 AS val > 0, V54 AS val > 0, V55 AS val > 0, V56 AS val > 0, V57 AS val > 0, V58 AS val > 0, V59 AS val > 0, V60 AS val > 0,
+    V61 AS val > 0, V62 AS val > 0, V63 AS val > 0, V64 AS val > 0, V65 AS val > 0, V66 AS val > 0, V67 AS val > 0, V68 AS val > 0, V69 AS val > 0, V70 AS val > 0,
+    V71 AS val > 0, V72 AS val > 0, V73 AS val > 0, V74 AS val > 0, V75 AS val > 0, V76 AS val > 0, V77 AS val > 0, V78 AS val > 0, V79 AS val > 0, V80 AS val > 0,
+    V81 AS val > 0, V82 AS val > 0, V83 AS val > 0, V84 AS val > 0, V85 AS val > 0, V86 AS val > 0, V87 AS val > 0, V88 AS val > 0, V89 AS val > 0, V90 AS val > 0,
+    V91 AS val > 0, V92 AS val > 0, V93 AS val > 0, V94 AS val > 0, V95 AS val > 0, V96 AS val > 0, V97 AS val > 0, V98 AS val > 0, V99 AS val > 0, V100 AS val > 0,
+    V101 AS val > 0, V102 AS val > 0, V103 AS val > 0, V104 AS val > 0, V105 AS val > 0, V106 AS val > 0, V107 AS val > 0, V108 AS val > 0, V109 AS val > 0, V110 AS val > 0,
+    V111 AS val > 0, V112 AS val > 0, V113 AS val > 0, V114 AS val > 0, V115 AS val > 0, V116 AS val > 0, V117 AS val > 0, V118 AS val > 0, V119 AS val > 0, V120 AS val > 0,
+    V121 AS val > 0, V122 AS val > 0, V123 AS val > 0, V124 AS val > 0, V125 AS val > 0, V126 AS val > 0, V127 AS val > 0, V128 AS val > 0, V129 AS val > 0, V130 AS val > 0,
+    V131 AS val > 0, V132 AS val > 0, V133 AS val > 0, V134 AS val > 0, V135 AS val > 0, V136 AS val > 0, V137 AS val > 0, V138 AS val > 0, V139 AS val > 0, V140 AS val > 0,
+    V141 AS val > 0, V142 AS val > 0, V143 AS val > 0, V144 AS val > 0, V145 AS val > 0, V146 AS val > 0, V147 AS val > 0, V148 AS val > 0, V149 AS val > 0, V150 AS val > 0,
+    V151 AS val > 0, V152 AS val > 0, V153 AS val > 0, V154 AS val > 0, V155 AS val > 0, V156 AS val > 0, V157 AS val > 0, V158 AS val > 0, V159 AS val > 0, V160 AS val > 0,
+    V161 AS val > 0, V162 AS val > 0, V163 AS val > 0, V164 AS val > 0, V165 AS val > 0, V166 AS val > 0, V167 AS val > 0, V168 AS val > 0, V169 AS val > 0, V170 AS val > 0,
+    V171 AS val > 0, V172 AS val > 0, V173 AS val > 0, V174 AS val > 0, V175 AS val > 0, V176 AS val > 0, V177 AS val > 0, V178 AS val > 0, V179 AS val > 0, V180 AS val > 0,
+    V181 AS val > 0, V182 AS val > 0, V183 AS val > 0, V184 AS val > 0, V185 AS val > 0, V186 AS val > 0, V187 AS val > 0, V188 AS val > 0, V189 AS val > 0, V190 AS val > 0,
+    V191 AS val > 0, V192 AS val > 0, V193 AS val > 0, V194 AS val > 0, V195 AS val > 0, V196 AS val > 0, V197 AS val > 0, V198 AS val > 0, V199 AS val > 0, V200 AS val > 0,
+    V201 AS val > 0, V202 AS val > 0, V203 AS val > 0, V204 AS val > 0, V205 AS val > 0, V206 AS val > 0, V207 AS val > 0, V208 AS val > 0, V209 AS val > 0, V210 AS val > 0,
+    V211 AS val > 0, V212 AS val > 0, V213 AS val > 0, V214 AS val > 0, V215 AS val > 0, V216 AS val > 0, V217 AS val > 0, V218 AS val > 0, V219 AS val > 0, V220 AS val > 0,
+    V221 AS val > 0, V222 AS val > 0, V223 AS val > 0, V224 AS val > 0, V225 AS val > 0, V226 AS val > 0, V227 AS val > 0, V228 AS val > 0, V229 AS val > 0, V230 AS val > 0,
+    V231 AS val > 0, V232 AS val > 0, V233 AS val > 0, V234 AS val > 0, V235 AS val > 0, V236 AS val > 0, V237 AS val > 0, V238 AS val > 0, V239 AS val > 0, V240 AS val > 0,
+    V241 AS val > 0, V242 AS val > 0, V243 AS val > 0, V244 AS val > 0, V245 AS val > 0, V246 AS val > 0, V247 AS val > 0, V248 AS val > 0, V249 AS val > 0, V250 AS val > 0,
+    V251 AS val > 0
+);
+-- Expected: Success - exactly at RPR_VARID_MAX boundary
+
+-- Test: 252 variables in PATTERN, 251 in DEFINE (exceeds limit with implicit TRUE)
+SELECT COUNT(*) OVER w FROM rpr_errors
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (V1 V2 V3 V4 V5 V6 V7 V8 V9 V10 V11 V12 V13 V14 V15 V16 V17 V18 V19 V20 V21 V22 V23 V24 V25 V26 V27 V28 V29 V30 V31 V32 V33 V34 V35 V36 V37 V38 V39 V40 V41 V42 V43 V44 V45 V46 V47 V48 V49 V50 V51 V52 V53 V54 V55 V56 V57 V58 V59 V60 V61 V62 V63 V64 V65 V66 V67 V68 V69 V70 V71 V72 V73 V74 V75 V76 V77 V78 V79 V80 V81 V82 V83 V84 V85 V86 V87 V88 V89 V90 V91 V92 V93 V94 V95 V96 V97 V98 V99 V100 V101 V102 V103 V104 V105 V106 V107 V108 V109 V110 V111 V112 V113 V114 V115 V116 V117 V118 V119 V120 V121 V122 V123 V124 V125 V126 V127 V128 V129 V130 V131 V132 V133 V134 V135 V136 V137 V138 V139 V140 V141 V142 V143 V144 V145 V146 V147 V148 V149 V150 V151 V152 V153 V154 V155 V156 V157 V158 V159 V160 V161 V162 V163 V164 V165 V166 V167 V168 V169 V170 V171 V172 V173 V174 V175 V176 V177 V178 V179 V180 V181 V182 V183 V184 V185 V186 V187 V188 V189 V190 V191 V192 V193 V194 V195 V196 V197 V198 V199 V200 V201 V202 V203 V204 V205 V206 V207 V208 V209 V210 V211 V212 V213 V214 V215 V216 V217 V218 V219 V220 V221 V222 V223 V224 V225 V226 V227 V228 V229 V230 V231 V232 V233 V234 V235 V236 V237 V238 V239 V240 V241 V242 V243 V244 V245 V246 V247 V248 V249 V250 V251 V252)
+    DEFINE
+    V1 AS val > 0, V2 AS val > 0, V3 AS val > 0, V4 AS val > 0, V5 AS val > 0, V6 AS val > 0, V7 AS val > 0, V8 AS val > 0, V9 AS val > 0, V10 AS val > 0,
+    V11 AS val > 0, V12 AS val > 0, V13 AS val > 0, V14 AS val > 0, V15 AS val > 0, V16 AS val > 0, V17 AS val > 0, V18 AS val > 0, V19 AS val > 0, V20 AS val > 0,
+    V21 AS val > 0, V22 AS val > 0, V23 AS val > 0, V24 AS val > 0, V25 AS val > 0, V26 AS val > 0, V27 AS val > 0, V28 AS val > 0, V29 AS val > 0, V30 AS val > 0,
+    V31 AS val > 0, V32 AS val > 0, V33 AS val > 0, V34 AS val > 0, V35 AS val > 0, V36 AS val > 0, V37 AS val > 0, V38 AS val > 0, V39 AS val > 0, V40 AS val > 0,
+    V41 AS val > 0, V42 AS val > 0, V43 AS val > 0, V44 AS val > 0, V45 AS val > 0, V46 AS val > 0, V47 AS val > 0, V48 AS val > 0, V49 AS val > 0, V50 AS val > 0,
+    V51 AS val > 0, V52 AS val > 0, V53 AS val > 0, V54 AS val > 0, V55 AS val > 0, V56 AS val > 0, V57 AS val > 0, V58 AS val > 0, V59 AS val > 0, V60 AS val > 0,
+    V61 AS val > 0, V62 AS val > 0, V63 AS val > 0, V64 AS val > 0, V65 AS val > 0, V66 AS val > 0, V67 AS val > 0, V68 AS val > 0, V69 AS val > 0, V70 AS val > 0,
+    V71 AS val > 0, V72 AS val > 0, V73 AS val > 0, V74 AS val > 0, V75 AS val > 0, V76 AS val > 0, V77 AS val > 0, V78 AS val > 0, V79 AS val > 0, V80 AS val > 0,
+    V81 AS val > 0, V82 AS val > 0, V83 AS val > 0, V84 AS val > 0, V85 AS val > 0, V86 AS val > 0, V87 AS val > 0, V88 AS val > 0, V89 AS val > 0, V90 AS val > 0,
+    V91 AS val > 0, V92 AS val > 0, V93 AS val > 0, V94 AS val > 0, V95 AS val > 0, V96 AS val > 0, V97 AS val > 0, V98 AS val > 0, V99 AS val > 0, V100 AS val > 0,
+    V101 AS val > 0, V102 AS val > 0, V103 AS val > 0, V104 AS val > 0, V105 AS val > 0, V106 AS val > 0, V107 AS val > 0, V108 AS val > 0, V109 AS val > 0, V110 AS val > 0,
+    V111 AS val > 0, V112 AS val > 0, V113 AS val > 0, V114 AS val > 0, V115 AS val > 0, V116 AS val > 0, V117 AS val > 0, V118 AS val > 0, V119 AS val > 0, V120 AS val > 0,
+    V121 AS val > 0, V122 AS val > 0, V123 AS val > 0, V124 AS val > 0, V125 AS val > 0, V126 AS val > 0, V127 AS val > 0, V128 AS val > 0, V129 AS val > 0, V130 AS val > 0,
+    V131 AS val > 0, V132 AS val > 0, V133 AS val > 0, V134 AS val > 0, V135 AS val > 0, V136 AS val > 0, V137 AS val > 0, V138 AS val > 0, V139 AS val > 0, V140 AS val > 0,
+    V141 AS val > 0, V142 AS val > 0, V143 AS val > 0, V144 AS val > 0, V145 AS val > 0, V146 AS val > 0, V147 AS val > 0, V148 AS val > 0, V149 AS val > 0, V150 AS val > 0,
+    V151 AS val > 0, V152 AS val > 0, V153 AS val > 0, V154 AS val > 0, V155 AS val > 0, V156 AS val > 0, V157 AS val > 0, V158 AS val > 0, V159 AS val > 0, V160 AS val > 0,
+    V161 AS val > 0, V162 AS val > 0, V163 AS val > 0, V164 AS val > 0, V165 AS val > 0, V166 AS val > 0, V167 AS val > 0, V168 AS val > 0, V169 AS val > 0, V170 AS val > 0,
+    V171 AS val > 0, V172 AS val > 0, V173 AS val > 0, V174 AS val > 0, V175 AS val > 0, V176 AS val > 0, V177 AS val > 0, V178 AS val > 0, V179 AS val > 0, V180 AS val > 0,
+    V181 AS val > 0, V182 AS val > 0, V183 AS val > 0, V184 AS val > 0, V185 AS val > 0, V186 AS val > 0, V187 AS val > 0, V188 AS val > 0, V189 AS val > 0, V190 AS val > 0,
+    V191 AS val > 0, V192 AS val > 0, V193 AS val > 0, V194 AS val > 0, V195 AS val > 0, V196 AS val > 0, V197 AS val > 0, V198 AS val > 0, V199 AS val > 0, V200 AS val > 0,
+    V201 AS val > 0, V202 AS val > 0, V203 AS val > 0, V204 AS val > 0, V205 AS val > 0, V206 AS val > 0, V207 AS val > 0, V208 AS val > 0, V209 AS val > 0, V210 AS val > 0,
+    V211 AS val > 0, V212 AS val > 0, V213 AS val > 0, V214 AS val > 0, V215 AS val > 0, V216 AS val > 0, V217 AS val > 0, V218 AS val > 0, V219 AS val > 0, V220 AS val > 0,
+    V221 AS val > 0, V222 AS val > 0, V223 AS val > 0, V224 AS val > 0, V225 AS val > 0, V226 AS val > 0, V227 AS val > 0, V228 AS val > 0, V229 AS val > 0, V230 AS val > 0,
+    V231 AS val > 0, V232 AS val > 0, V233 AS val > 0, V234 AS val > 0, V235 AS val > 0, V236 AS val > 0, V237 AS val > 0, V238 AS val > 0, V239 AS val > 0, V240 AS val > 0,
+    V241 AS val > 0, V242 AS val > 0, V243 AS val > 0, V244 AS val > 0, V245 AS val > 0, V246 AS val > 0, V247 AS val > 0, V248 AS val > 0, V249 AS val > 0, V250 AS val > 0,
+    V251 AS val > 0
+);
+-- Expected: ERROR - too many pattern variables (Maximum is 251)
+
+-- Test: Pattern nesting at maximum depth (depth 253)
+-- Note: 253 nested GROUP{3,7} quantifiers produce depth 253 after optimization
+SELECT id, val, COUNT(*) OVER w FROM rpr_errors
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((A{3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7})
+    DEFINE A AS val > 0
+);
+-- Expected: Should succeed
+
+-- Test: Pattern nesting depth exceeds maximum (depth 254)
+-- Note: 254 nested GROUP{3,7} quantifiers produce depth 254 after optimization
+SELECT id, val, COUNT(*) OVER w FROM rpr_errors
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    PATTERN (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((A{3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7}){3,7})
+    DEFINE A AS val > 0
+);
+-- Expected: ERROR - pattern nesting too deep
+
+DROP TABLE rpr_errors;
+
+-- ============================================================
+-- Jacob's Patterns
+-- ============================================================
+-- Basic pattern matching tests from jacob branch
+
+-- Test: A? (optional, greedy)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A?)
+    DEFINE A AS val > 50
+);
+
+-- Test: A{2} (exact count)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A{2})
+    DEFINE A AS val <= 50
+);
+
+-- Test: A{1,3} (bounded range, greedy)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A{1,3})
+    DEFINE A AS val <= 50
+);
+
+-- Test: A | B (simple alternation)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A | B)
+    DEFINE A AS val <= 30, B AS val > 70
+);
+
+-- Test: A | B | C (three-way alternation)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A | B | C)
+    DEFINE A AS val <= 20, B AS val BETWEEN 40 AND 60, C AS val > 80
+);
+
+-- Test: A B C (concatenation)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B C)
+    DEFINE A AS val <= 30, B AS val BETWEEN 31 AND 60, C AS val > 60
+);
+
+-- Test: A B? C (optional middle)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A B? C)
+    DEFINE A AS val <= 30, B AS val BETWEEN 31 AND 60, C AS val > 60
+);
+
+-- Test: (A B)+ (grouped quantifier)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A B)+)
+    DEFINE A AS val <= 50, B AS val > 50
+);
+
+-- Test: (A | B)+ C (alternation with quantifier)
+SELECT id, val, count(*) OVER w AS c
+FROM rpr_plan
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A | B)+ C)
+    DEFINE A AS val <= 30, B AS val BETWEEN 31 AND 60, C AS val > 80
+);
+
+-- Test: (A+ | (A | B)+)* - nested alternation inside quantified group
+-- Previously caused infinite recursion in nfa_advance_alt when the inner
+-- BEGIN(+)'s skip jump was followed as an ALT branch pointer.
+SELECT id, flags, first_value(id) OVER w AS match_start, last_value(id) OVER w AS match_end
+FROM (VALUES
+    (1, ARRAY['A', 'B']),
+    (2, ARRAY['B']),
+    (3, ARRAY['C'])
+) AS t(id, flags)
+WINDOW w AS (
+    ORDER BY id
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN ((A+ | (A | B)+)*)
+    DEFINE
+        A AS 'A' = ANY(flags),
+        B AS 'B' = ANY(flags)
+);
+
+-- ============================================================
+-- Pathological Patterns
+-- ============================================================
+-- These patterns previously caused issues. Now optimized or handled safely.
+
+-- Test: (A*)* - nested unbounded (optimized to A*)
+SELECT v, count(*) OVER w AS c
+FROM (SELECT generate_series(1, 5) v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    INITIAL
+    PATTERN ((A*)*)
+    DEFINE A AS TRUE
+);
+
+-- Test: (A*)+ - inner nullable (optimized to A*)
+SELECT v, count(*) OVER w AS c
+FROM (SELECT generate_series(1, 5) v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    INITIAL
+    PATTERN ((A*)+)
+    DEFINE A AS TRUE
+);
+
+-- Test: (A+)* - outer nullable (optimized to A*)
+SELECT v, count(*) OVER w AS c
+FROM (SELECT generate_series(1, 5) v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    INITIAL
+    PATTERN ((A+)*)
+    DEFINE A AS TRUE
+);
+
+-- Test: (A+)+ - both require match (optimized to A+)
+SELECT v, count(*) OVER w AS c
+FROM (SELECT generate_series(1, 5) v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    INITIAL
+    PATTERN ((A+)+)
+    DEFINE A AS TRUE
+);
+
+-- Test: (((A)*)*)*  - triple nested (optimized to A*)
+SELECT v, count(*) OVER w AS c
+FROM (SELECT generate_series(1, 3) v)
+WINDOW w AS (
+    ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+    AFTER MATCH SKIP PAST LAST ROW
+    INITIAL
+    PATTERN ((((A)*)*)*)
+    DEFINE A AS TRUE
+);
+
+-- Optional group with alternation: A ((B | C) (D | E))* F?
+-- When only A matches, the * group matches 0 times and F? matches 0 times
+SELECT id, val, match_len
+FROM (SELECT id, val,
+             COUNT(*) OVER w AS match_len
+      FROM (VALUES (1, 1), (2, 99)) AS t(id, val)
+      WINDOW w AS (
+          ORDER BY id
+          ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+          AFTER MATCH SKIP PAST LAST ROW
+          PATTERN (A ((B | C) (D | E))* F?)
+          DEFINE A AS val = 1,
+                 B AS val = 2, C AS val = 3,
+                 D AS val = 4, E AS val = 5,
+                 F AS val = 6
+      )
+) s;
+
+DROP TABLE rpr_plan;

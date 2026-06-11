@@ -30,6 +30,7 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/rpr.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
@@ -119,6 +120,20 @@ static void show_window_def(WindowAggState *planstate,
 static void show_window_keys(StringInfo buf, PlanState *planstate,
 							 int nkeys, AttrNumber *keycols,
 							 List *ancestors, ExplainState *es);
+static void append_rpr_quantifier(StringInfo buf, RPRPatternElement *elem);
+static char *deparse_rpr_pattern(RPRPattern *pattern);
+static void deparse_rpr_elements(RPRPattern *pattern, int *idx,
+								 StringInfoData *buf, RPRDepth groupDepth,
+								 RPRDepth *prevDepth, bool *needSpace);
+static void deparse_rpr_group(RPRPattern *pattern, int *idx,
+							  StringInfoData *buf, RPRDepth *prevDepth,
+							  bool *needSpace);
+static void deparse_rpr_alt(RPRPattern *pattern, int *idx,
+							StringInfoData *buf, RPRDepth *prevDepth,
+							bool *needSpace, List **altSeps);
+static void deparse_rpr_var(RPRPattern *pattern, int *idx,
+							StringInfoData *buf, RPRDepth *prevDepth,
+							bool *needSpace, List **altSeps);
 static void show_storage_info(char *maxStorageType, int64 maxSpaceUsed,
 							  ExplainState *es);
 static void show_tablesample(TableSampleClause *tsc, PlanState *planstate,
@@ -129,6 +144,7 @@ static void show_incremental_sort_info(IncrementalSortState *incrsortstate,
 static void show_hash_info(HashState *hashstate, ExplainState *es);
 static void show_material_info(MaterialState *mstate, ExplainState *es);
 static void show_windowagg_info(WindowAggState *winstate, ExplainState *es);
+static void show_rpr_nfa_stats(WindowAggState *winstate, ExplainState *es);
 static void show_ctescan_info(CteScanState *ctescanstate, ExplainState *es);
 static void show_table_func_scan_info(TableFuncScanState *tscanstate,
 									  ExplainState *es);
@@ -2899,6 +2915,284 @@ show_sortorder_options(StringInfo buf, Node *sortexpr,
 }
 
 /*
+ * Append quantifier suffix for a pattern element.
+ */
+static void
+append_rpr_quantifier(StringInfo buf, RPRPatternElement *elem)
+{
+	/* Append quantifier if not {1,1} */
+	if (elem->min == 0 && elem->max == RPR_QUANTITY_INF)
+		appendStringInfoChar(buf, '*');
+	else if (elem->min == 1 && elem->max == RPR_QUANTITY_INF)
+		appendStringInfoChar(buf, '+');
+	else if (elem->min == 0 && elem->max == 1)
+		appendStringInfoChar(buf, '?');
+	else if (elem->max == RPR_QUANTITY_INF)
+		appendStringInfo(buf, "{%d,}", elem->min);
+	else if (elem->min == elem->max && elem->min != 1)
+		appendStringInfo(buf, "{%d}", elem->min);
+	else if (elem->min != 1 || elem->max != 1)
+		appendStringInfo(buf, "{%d,%d}", elem->min, elem->max);
+
+	if (RPRElemIsReluctant(elem))
+	{
+		if (elem->min == 1 && elem->max == 1)
+			appendStringInfo(buf, "{1}");	/* make reluctant ? unambiguous */
+		appendStringInfoChar(buf, '?');
+	}
+
+	/* Append absorption markers: " for judgment point, ' for branch only */
+	if (RPRElemIsAbsorbable(elem))
+	{
+		Assert(elem->max == RPR_QUANTITY_INF);
+		appendStringInfoChar(buf, '"');
+	}
+	else if (RPRElemIsAbsorbableBranch(elem))
+		appendStringInfoChar(buf, '\'');
+}
+
+/*
+ * Deparse a compiled RPRPattern (bytecode) back to pattern string.
+ *
+ * Walks the flat bytecode array using mutual recursion: deparse_rpr_elements
+ * processes sequential elements, and deparse_rpr_group handles BEGIN...END
+ * groups by recursing back into deparse_rpr_elements for the group content.
+ */
+static char *
+deparse_rpr_pattern(RPRPattern *pattern)
+{
+	StringInfoData buf;
+	int			idx = 0;
+	RPRDepth	prevDepth = 0;
+	bool		needSpace = false;
+
+	Assert(pattern != NULL && pattern->numElements >= 2);
+
+	initStringInfo(&buf);
+
+	deparse_rpr_elements(pattern, &idx, &buf, RPR_DEPTH_NONE,
+						 &prevDepth, &needSpace);
+
+	/* Close remaining open parens */
+	while (prevDepth > 0)
+	{
+		appendStringInfoChar(&buf, ')');
+		prevDepth--;
+	}
+
+	return buf.data;
+}
+
+/*
+ * Process pattern elements sequentially until FIN or END at groupDepth.
+ *
+ * When groupDepth >= 0, stops at the matching END element (leaving idx
+ * pointing to it) so the caller (deparse_rpr_group) can consume it.
+ * When groupDepth < 0, processes until FIN (top-level call).
+ */
+static void
+deparse_rpr_elements(RPRPattern *pattern, int *idx, StringInfoData *buf,
+					 RPRDepth groupDepth, RPRDepth *prevDepth,
+					 bool *needSpace)
+{
+	List	   *altSeps = NIL;	/* pending alternation separator indices */
+
+	while (*idx < pattern->numElements)
+	{
+		RPRPatternElement *elem = &pattern->elements[*idx];
+
+		if (RPRElemIsFin(elem))
+			break;
+
+		/* Stop at END matching our group depth; caller handles it */
+		if (RPRElemIsEnd(elem) && elem->depth == groupDepth)
+			break;
+
+		/* Alternation separator */
+		if (list_member_int(altSeps, *idx))
+		{
+			/* Close parens to match separator depth first */
+			while (*prevDepth > elem->depth)
+			{
+				appendStringInfoChar(buf, ')');
+				(*prevDepth)--;
+			}
+			appendStringInfoString(buf, " | ");
+			*needSpace = false;
+			altSeps = list_delete_int(altSeps, *idx);
+		}
+
+		/* Dispatch to element-type handlers */
+		if (RPRElemIsAlt(elem))
+			deparse_rpr_alt(pattern, idx, buf, prevDepth,
+							needSpace, &altSeps);
+		else if (RPRElemIsBegin(elem))
+			deparse_rpr_group(pattern, idx, buf, prevDepth,
+							  needSpace);
+		else if (RPRElemIsVar(elem))
+			deparse_rpr_var(pattern, idx, buf, prevDepth,
+							needSpace, &altSeps);
+	}
+	list_free(altSeps);
+}
+
+/*
+ * Process a BEGIN...END group.
+ *
+ * Consumes BEGIN, recurses into deparse_rpr_elements for group content,
+ * then consumes END and outputs the group quantifier.
+ *
+ * When the group wraps a single ALT with no siblings, the group-level
+ * parenthesis is suppressed since the ALT-to-children depth transition
+ * already provides it (avoids double parens like "((a | b))+").
+ */
+static void
+deparse_rpr_group(RPRPattern *pattern, int *idx, StringInfoData *buf,
+				  RPRDepth *prevDepth, bool *needSpace)
+{
+	RPRPatternElement *begin = &pattern->elements[*idx];
+	RPRDepth	childDepth = begin->depth + 1;
+	bool		singleAlt = false;
+	RPRPatternElement *end;
+
+	/*
+	 * Check if this group wraps a single ALT with no siblings. Scan from
+	 * after ALT to END: if no element at childDepth exists, the ALT is the
+	 * sole child.
+	 */
+	if (*idx + 1 < pattern->numElements &&
+		RPRElemIsAlt(&pattern->elements[*idx + 1]))
+	{
+		int			j;
+
+		singleAlt = true;
+		for (j = *idx + 2; j < pattern->numElements; j++)
+		{
+			RPRPatternElement *e = &pattern->elements[j];
+
+			if (RPRElemIsEnd(e) && e->depth == begin->depth)
+				break;
+			if (e->depth <= childDepth)
+			{
+				singleAlt = false;
+				break;
+			}
+		}
+	}
+
+	/* Open group paren (unless single ALT provides it) */
+	if (!singleAlt)
+	{
+		if (*needSpace)
+			appendStringInfoChar(buf, ' ');
+		appendStringInfoChar(buf, '(');
+		*needSpace = false;
+	}
+	*prevDepth = childDepth;
+	(*idx)++;					/* consume BEGIN */
+
+	/* Process group children; stops at matching END */
+	deparse_rpr_elements(pattern, idx, buf, begin->depth,
+						 prevDepth, needSpace);
+
+	/* Consume END and output quantifier */
+	Assert(*idx < pattern->numElements);
+	end = &pattern->elements[*idx];
+	Assert(RPRElemIsEnd(end) && end->depth == begin->depth);
+
+	while (*prevDepth > end->depth + 1)
+	{
+		appendStringInfoChar(buf, ')');
+		(*prevDepth)--;
+	}
+	if (!singleAlt)
+		appendStringInfoChar(buf, ')');
+	append_rpr_quantifier(buf, end);
+	*prevDepth = end->depth;
+	*needSpace = true;
+	(*idx)++;					/* consume END */
+}
+
+/*
+ * Process an ALT element: adjust depth parens and register separator positions.
+ */
+static void
+deparse_rpr_alt(RPRPattern *pattern, int *idx, StringInfoData *buf,
+				RPRDepth *prevDepth, bool *needSpace, List **altSeps)
+{
+	RPRPatternElement *elem = &pattern->elements[*idx];
+
+	/* Close parens for depth decrease */
+	while (*prevDepth > elem->depth)
+	{
+		appendStringInfoChar(buf, ')');
+		(*prevDepth)--;
+		*needSpace = true;
+	}
+
+	/* Open parens up to ALT's depth */
+	while (*prevDepth < elem->depth)
+	{
+		if (*needSpace)
+			appendStringInfoChar(buf, ' ');
+		appendStringInfoChar(buf, '(');
+		(*prevDepth)++;
+		*needSpace = false;
+	}
+
+	/* Register next alternation separator position */
+	if (elem->next != RPR_ELEMIDX_INVALID)
+	{
+		RPRPatternElement *firstElem = &pattern->elements[elem->next];
+
+		if (firstElem->jump != RPR_ELEMIDX_INVALID)
+			*altSeps = lappend_int(*altSeps, firstElem->jump);
+	}
+	if (elem->jump != RPR_ELEMIDX_INVALID)
+		*altSeps = lappend_int(*altSeps, elem->jump);
+	(*idx)++;
+}
+
+/*
+ * Process a VAR element: adjust depth parens and output variable name.
+ */
+static void
+deparse_rpr_var(RPRPattern *pattern, int *idx, StringInfoData *buf,
+				RPRDepth *prevDepth, bool *needSpace, List **altSeps)
+{
+	RPRPatternElement *elem = &pattern->elements[*idx];
+
+	/* Open parens for depth increase */
+	while (*prevDepth < elem->depth)
+	{
+		if (*needSpace)
+			appendStringInfoChar(buf, ' ');
+		appendStringInfoChar(buf, '(');
+		(*prevDepth)++;
+		*needSpace = false;
+	}
+
+	/* Close parens for depth decrease */
+	while (*prevDepth > elem->depth)
+	{
+		appendStringInfoChar(buf, ')');
+		(*prevDepth)--;
+	}
+
+	if (*needSpace)
+		appendStringInfoChar(buf, ' ');
+
+	Assert(elem->varId < pattern->numVars);
+	appendStringInfoString(buf, quote_identifier(pattern->varNames[elem->varId]));
+	append_rpr_quantifier(buf, elem);
+	*needSpace = true;
+
+	if (elem->jump != RPR_ELEMIDX_INVALID)
+		*altSeps = lappend_int(*altSeps, elem->jump);
+	(*idx)++;
+}
+
+/*
  * Show the window definition for a WindowAgg node.
  */
 static void
@@ -2956,6 +3250,79 @@ show_window_def(WindowAggState *planstate, List *ancestors, ExplainState *es)
 	appendStringInfoChar(&wbuf, ')');
 	ExplainPropertyText("Window", wbuf.data, es);
 	pfree(wbuf.data);
+
+	/* Show Row Pattern Recognition pattern if present */
+	if (wagg->rpPattern != NULL)
+	{
+		char	   *patternStr = deparse_rpr_pattern(wagg->rpPattern);
+
+		if (patternStr != NULL)
+		{
+			ExplainPropertyText("Pattern", patternStr, es);
+			pfree(patternStr);
+		}
+
+		/*
+		 * Show navigation offsets for tuplestore trim.  For EXPLAIN ANALYZE,
+		 * use the executor-resolved values (which may differ from the plan
+		 * when NEEDS_EVAL was resolved to FIXED or RETAIN_ALL at init).
+		 */
+		{
+			RPRNavOffsetKind maxKind = wagg->navMaxOffsetKind;
+			int64		maxOffset = wagg->navMaxOffset;
+			RPRNavOffsetKind firstKind = wagg->navFirstOffsetKind;
+			int64		firstOffset = wagg->navFirstOffset;
+
+			if (es->analyze)
+			{
+				maxKind = planstate->navMaxOffsetKind;
+				maxOffset = planstate->navMaxOffset;
+				firstKind = planstate->navFirstOffsetKind;
+				firstOffset = planstate->navFirstOffset;
+			}
+
+			switch (maxKind)
+			{
+				case RPR_NAV_OFFSET_NEEDS_EVAL:
+					ExplainPropertyText("Nav Mark Lookback", "runtime", es);
+					break;
+				case RPR_NAV_OFFSET_RETAIN_ALL:
+					ExplainPropertyText("Nav Mark Lookback", "retain all", es);
+					break;
+				case RPR_NAV_OFFSET_FIXED:
+					ExplainPropertyInteger("Nav Mark Lookback", NULL,
+										   maxOffset, es);
+					break;
+				default:
+					elog(ERROR, "unrecognized RPR nav offset kind: %d",
+						 maxKind);
+					break;
+			}
+
+			if (wagg->hasFirstNav)
+			{
+				switch (firstKind)
+				{
+					case RPR_NAV_OFFSET_NEEDS_EVAL:
+						ExplainPropertyText("Nav Mark Lookahead", "runtime",
+											es);
+						break;
+					case RPR_NAV_OFFSET_RETAIN_ALL:
+						ExplainPropertyText("Nav Mark Lookahead", "retain all",
+											es);
+						break;
+					case RPR_NAV_OFFSET_FIXED:
+						ExplainPropertyInteger("Nav Mark Lookahead", NULL,
+											   firstOffset, es);
+						break;
+					default:
+						elog(ERROR, "unrecognized RPR nav offset kind: %d",
+							 firstKind);
+						break;
+				}
+			}
+		}
+	}
 }
 
 /*
@@ -3508,6 +3875,7 @@ show_windowagg_info(WindowAggState *winstate, ExplainState *es)
 {
 	char	   *maxStorageType;
 	int64		maxSpaceUsed;
+	WindowAgg  *wagg = (WindowAgg *) winstate->ss.ps.plan;
 
 	Tuplestorestate *tupstore = winstate->buffer;
 
@@ -3520,6 +3888,160 @@ show_windowagg_info(WindowAggState *winstate, ExplainState *es)
 
 	tuplestore_get_stats(tupstore, &maxStorageType, &maxSpaceUsed);
 	show_storage_info(maxStorageType, maxSpaceUsed, es);
+
+	/* Show NFA statistics for Row Pattern Recognition */
+	if (wagg->rpPattern != NULL)
+		show_rpr_nfa_stats(winstate, es);
+}
+
+/*
+ * Show NFA statistics for Row Pattern Recognition on WindowAgg node.
+ */
+static void
+show_rpr_nfa_stats(WindowAggState *winstate, ExplainState *es)
+{
+	if (es->format != EXPLAIN_FORMAT_TEXT)
+	{
+		/* State and context counters */
+		ExplainPropertyInteger("NFA States Peak", NULL, winstate->nfaStatesMax, es);
+		ExplainPropertyInteger("NFA States Total", NULL, winstate->nfaStatesTotalCreated, es);
+		ExplainPropertyInteger("NFA States Merged", NULL, winstate->nfaStatesMerged, es);
+		ExplainPropertyInteger("NFA Contexts Peak", NULL, winstate->nfaContextsMax, es);
+		ExplainPropertyInteger("NFA Contexts Total", NULL, winstate->nfaContextsTotalCreated, es);
+		ExplainPropertyInteger("NFA Contexts Absorbed", NULL, winstate->nfaContextsAbsorbed, es);
+		ExplainPropertyInteger("NFA Contexts Skipped", NULL, winstate->nfaContextsSkipped, es);
+		ExplainPropertyInteger("NFA Contexts Pruned", NULL, winstate->nfaContextsPruned, es);
+
+		/* Match/mismatch counts and length statistics */
+		ExplainPropertyInteger("NFA Matched", NULL, winstate->nfaMatchesSucceeded, es);
+		ExplainPropertyInteger("NFA Mismatched", NULL, winstate->nfaMatchesFailed, es);
+		if (winstate->nfaMatchesSucceeded > 0)
+		{
+			ExplainPropertyInteger("NFA Match Length Min", NULL, winstate->nfaMatchLen.min, es);
+			ExplainPropertyInteger("NFA Match Length Max", NULL, winstate->nfaMatchLen.max, es);
+			ExplainPropertyFloat("NFA Match Length Avg", NULL,
+								 (double) winstate->nfaMatchLen.total / winstate->nfaMatchesSucceeded, 1,
+								 es);
+		}
+		if (winstate->nfaMatchesFailed > 0)
+		{
+			ExplainPropertyInteger("NFA Mismatch Length Min", NULL, winstate->nfaFailLen.min, es);
+			ExplainPropertyInteger("NFA Mismatch Length Max", NULL, winstate->nfaFailLen.max, es);
+			ExplainPropertyFloat("NFA Mismatch Length Avg", NULL,
+								 (double) winstate->nfaFailLen.total / winstate->nfaMatchesFailed, 1,
+								 es);
+		}
+
+		/* Absorbed/skipped context length statistics */
+		if (winstate->nfaContextsAbsorbed > 0)
+		{
+			ExplainPropertyInteger("NFA Absorbed Length Min", NULL, winstate->nfaAbsorbedLen.min, es);
+			ExplainPropertyInteger("NFA Absorbed Length Max", NULL, winstate->nfaAbsorbedLen.max, es);
+			ExplainPropertyFloat("NFA Absorbed Length Avg", NULL,
+								 (double) winstate->nfaAbsorbedLen.total / winstate->nfaContextsAbsorbed, 1,
+								 es);
+		}
+		if (winstate->nfaContextsSkipped > 0)
+		{
+			ExplainPropertyInteger("NFA Skipped Length Min", NULL, winstate->nfaSkippedLen.min, es);
+			ExplainPropertyInteger("NFA Skipped Length Max", NULL, winstate->nfaSkippedLen.max, es);
+			ExplainPropertyFloat("NFA Skipped Length Avg", NULL,
+								 (double) winstate->nfaSkippedLen.total / winstate->nfaContextsSkipped, 1,
+								 es);
+		}
+	}
+	else
+	{
+		/* State and context counters */
+		ExplainIndentText(es);
+		appendStringInfo(es->str,
+						 "NFA States: " INT64_FORMAT " peak, " INT64_FORMAT " total, " INT64_FORMAT " merged\n",
+						 winstate->nfaStatesMax,
+						 winstate->nfaStatesTotalCreated,
+						 winstate->nfaStatesMerged);
+		ExplainIndentText(es);
+		appendStringInfo(es->str,
+						 "NFA Contexts: " INT64_FORMAT " peak, " INT64_FORMAT " total, " INT64_FORMAT " pruned\n",
+						 winstate->nfaContextsMax,
+						 winstate->nfaContextsTotalCreated,
+						 winstate->nfaContextsPruned);
+
+		/* Match/mismatch counts with length min/max/avg */
+		ExplainIndentText(es);
+		appendStringInfo(es->str, "NFA: ");
+		if (winstate->nfaMatchesSucceeded > 0)
+		{
+			double		avgLen = (double) winstate->nfaMatchLen.total / winstate->nfaMatchesSucceeded;
+
+			appendStringInfo(es->str,
+							 INT64_FORMAT " matched (len " INT64_FORMAT "/" INT64_FORMAT "/%.1f)",
+							 winstate->nfaMatchesSucceeded,
+							 winstate->nfaMatchLen.min,
+							 winstate->nfaMatchLen.max,
+							 avgLen);
+		}
+		else
+		{
+			appendStringInfo(es->str, "0 matched");
+		}
+		if (winstate->nfaMatchesFailed > 0)
+		{
+			double		avgFail = (double) winstate->nfaFailLen.total / winstate->nfaMatchesFailed;
+
+			appendStringInfo(es->str,
+							 ", " INT64_FORMAT " mismatched (len " INT64_FORMAT "/" INT64_FORMAT "/%.1f)",
+							 winstate->nfaMatchesFailed,
+							 winstate->nfaFailLen.min,
+							 winstate->nfaFailLen.max,
+							 avgFail);
+		}
+		else
+		{
+			appendStringInfo(es->str, ", 0 mismatched");
+		}
+		appendStringInfoChar(es->str, '\n');
+
+		/* Absorbed/skipped context length statistics */
+		if (winstate->nfaContextsAbsorbed > 0 || winstate->nfaContextsSkipped > 0)
+		{
+			ExplainIndentText(es);
+			appendStringInfo(es->str, "NFA: ");
+
+			if (winstate->nfaContextsAbsorbed > 0)
+			{
+				double		avgAbsorbed = (double) winstate->nfaAbsorbedLen.total / winstate->nfaContextsAbsorbed;
+
+				appendStringInfo(es->str,
+								 INT64_FORMAT " absorbed (len " INT64_FORMAT "/" INT64_FORMAT "/%.1f)",
+								 winstate->nfaContextsAbsorbed,
+								 winstate->nfaAbsorbedLen.min,
+								 winstate->nfaAbsorbedLen.max,
+								 avgAbsorbed);
+			}
+			else
+			{
+				appendStringInfo(es->str, "0 absorbed");
+			}
+
+			if (winstate->nfaContextsSkipped > 0)
+			{
+				double		avgSkipped = (double) winstate->nfaSkippedLen.total / winstate->nfaContextsSkipped;
+
+				appendStringInfo(es->str,
+								 ", " INT64_FORMAT " skipped (len " INT64_FORMAT "/" INT64_FORMAT "/%.1f)",
+								 winstate->nfaContextsSkipped,
+								 winstate->nfaSkippedLen.min,
+								 winstate->nfaSkippedLen.max,
+								 avgSkipped);
+			}
+			else
+			{
+				appendStringInfo(es->str, ", 0 skipped");
+			}
+
+			appendStringInfoChar(es->str, '\n');
+		}
+	}
 }
 
 /*

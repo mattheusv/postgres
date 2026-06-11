@@ -761,6 +761,8 @@ ErrorData
 ErrorSaveContext
 EstimateDSMForeignScan_function
 EstimationInfo
+EvalNavFirstContext
+EvalNavMaxContext
 EventTriggerCacheEntry
 EventTriggerCacheItem
 EventTriggerCacheStateType
@@ -1831,6 +1833,8 @@ NamedLWLockTrancheRequest
 NamedTuplestoreScan
 NamedTuplestoreScanState
 NamespaceInfo
+NavCheckResult
+NavOffsetContext
 NestLoop
 NestLoopParam
 NestLoopState
@@ -1840,6 +1844,7 @@ NewConstraint
 NextSampleBlock_function
 NextSampleTuple_function
 NextValueExpr
+NFALengthStats
 Node
 NodeInstrumentation
 NodeTag
@@ -2511,6 +2516,9 @@ QuerySource
 QueueBackendStatus
 QueuePosition
 QuitSignalReason
+RPRNavExpr
+RPRNavKind
+RPRNavOffsetKind
 RBTNode
 RBTOrderControl
 RBTree
@@ -2523,6 +2531,19 @@ RI_ConstraintInfo
 RI_FastPathEntry
 RI_QueryHashEntry
 RI_QueryKey
+RPCommonSyntax
+RPRDepth
+RPRElemFlags
+RPRElemIdx
+RPRNFAContext
+RPRNFAState
+RPRPattern
+RPRPatternElement
+RPRPatternNode
+RPRPatternNodeType
+RPRQuantity
+RPRVarId
+RPSkipTo
 RTEKind
 RTEPermissionInfo
 RWConflict

@@ -582,6 +582,73 @@ typedef struct SortBy
 } SortBy;
 
 /*
+ * AFTER MATCH row pattern skip to types in row pattern common syntax
+ */
+typedef enum RPSkipTo
+{
+	ST_NONE,					/* no AFTER MATCH clause; default for non-RPR
+								 * windows */
+	ST_NEXT_ROW,				/* SKIP TO NEXT ROW */
+	ST_PAST_LAST_ROW			/* SKIP TO PAST LAST ROW */
+} RPSkipTo;
+
+/*
+ * RPRNavOffsetKind - status of navigation offset for tuplestore trim.
+ *
+ * The planner computes navMaxOffset/navFirstOffset for tuplestore mark
+ * optimization.  This enum tracks whether the value is a resolved constant,
+ * needs runtime evaluation, or cannot be determined (retain all rows).
+ */
+typedef enum RPRNavOffsetKind
+{
+	RPR_NAV_OFFSET_FIXED,		/* resolved constant; use the offset value */
+	RPR_NAV_OFFSET_NEEDS_EVAL,	/* non-constant offset; evaluate at executor
+								 * init */
+	RPR_NAV_OFFSET_RETAIN_ALL	/* cannot determine; retain all rows (no trim) */
+} RPRNavOffsetKind;
+
+/*
+ * RPRPatternNodeType - Row Pattern Recognition pattern node types
+ */
+typedef enum RPRPatternNodeType
+{
+	RPR_PATTERN_VAR,			/* variable reference */
+	RPR_PATTERN_SEQ,			/* sequence (concatenation) */
+	RPR_PATTERN_ALT,			/* alternation (|) */
+	RPR_PATTERN_GROUP			/* group (parentheses) */
+} RPRPatternNodeType;
+
+/*
+ * RPRPatternNode - Row Pattern Recognition pattern AST node
+ */
+typedef struct RPRPatternNode
+{
+	NodeTag		type;			/* T_RPRPatternNode */
+	RPRPatternNodeType nodeType;	/* VAR, SEQ, ALT, GROUP */
+	int			min;			/* minimum repetitions (0 for *, ?) */
+	int			max;			/* maximum repetitions (INT_MAX for *, +) */
+	bool		reluctant;		/* true for reluctant (non-greedy) */
+	ParseLoc	reluctant_location; /* location of '?' token, or -1 */
+	ParseLoc	location;		/* token location, or -1 */
+	char	   *varName;		/* VAR: variable name */
+	List	   *children;		/* SEQ, ALT, GROUP: child nodes */
+} RPRPatternNode;
+
+/*
+ * RowPatternCommonSyntax - raw representation of row pattern common syntax
+ */
+typedef struct RPCommonSyntax
+{
+	NodeTag		type;
+	RPSkipTo	rpSkipTo;		/* Row Pattern AFTER MATCH SKIP type */
+	bool		initial;		/* true if <row pattern initial or seek> is
+								 * initial */
+	RPRPatternNode *rpPattern;	/* PATTERN clause AST */
+	List	   *rpDefs;			/* row pattern definitions clause (list of
+								 * ResTarget) */
+} RPCommonSyntax;
+
+/*
  * WindowDef - raw representation of WINDOW and OVER clauses
  *
  * For entries in a WINDOW list, "name" is the window name being defined.
@@ -596,10 +663,13 @@ typedef struct WindowDef
 	char	   *refname;		/* referenced window name, if any */
 	List	   *partitionClause;	/* PARTITION BY expression list */
 	List	   *orderClause;	/* ORDER BY (list of SortBy) */
+	RPCommonSyntax *rpCommonSyntax; /* row pattern common syntax */
 	int			frameOptions;	/* frame_clause options, see below */
 	Node	   *startOffset;	/* expression for starting bound, if any */
 	Node	   *endOffset;		/* expression for ending bound, if any */
 	ParseLoc	location;		/* parse location, or -1 if none/unknown */
+	ParseLoc	frameLocation;	/* ROWS/RANGE/GROUPS location, or -1 */
+	ParseLoc	excludeLocation;	/* EXCLUDE location, or -1 */
 } WindowDef;
 
 /*
@@ -1648,6 +1718,11 @@ typedef struct GroupingSet
  * the orderClause might or might not be copied (see copiedOrder); the framing
  * options are never copied, per spec.
  *
+ * "defineClause" is Row Pattern Recognition DEFINE clause (list of
+ * TargetEntry). TargetEntry.resname represents row pattern definition
+ * variable name. "rpPattern" represents PATTERN clause as an AST tree
+ * (RPRPatternNode).
+ *
  * The information relevant for the query jumbling is the partition clause
  * type and its bounds.
  */
@@ -1677,6 +1752,14 @@ typedef struct WindowClause
 	Index		winref;			/* ID referenced by window functions */
 	/* did we copy orderClause from refname? */
 	bool		copiedOrder pg_node_attr(query_jumble_ignore);
+	/* Row Pattern AFTER MATCH SKIP clause */
+	RPSkipTo	rpSkipTo;		/* Row Pattern Skip To type */
+	bool		initial;		/* true if <row pattern initial or seek> is
+								 * initial */
+	/* Row Pattern DEFINE clause (list of TargetEntry) */
+	List	   *defineClause;
+	/* Row Pattern PATTERN clause AST */
+	RPRPatternNode *rpPattern;
 } WindowClause;
 
 /*

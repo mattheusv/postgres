@@ -208,6 +208,26 @@ SELECT a, c, sum(b), avg(c), count(*) FROM pagg_tab_m GROUP BY (a+b)/2, 2, 1 HAV
 SELECT a, c, sum(b), avg(c), count(*) FROM pagg_tab_m GROUP BY (a+b)/2, 2, 1 HAVING sum(b) = 50 AND avg(c) > 25 ORDER BY 1, 2, 3;
 
 
+-- Partition by an expression that is a binary-compatible cast, so that the
+-- stored partition key expression is itself wrapped in a RelabelType
+
+CREATE TABLE pagg_tab_v (a int, c varchar(40)) PARTITION BY LIST ((c::text));
+CREATE TABLE pagg_tab_v_p1 PARTITION OF pagg_tab_v FOR VALUES IN ('0000', '0001');
+CREATE TABLE pagg_tab_v_p2 PARTITION OF pagg_tab_v FOR VALUES IN ('0002');
+INSERT INTO pagg_tab_v SELECT i, to_char(i % 3, 'FM0000') FROM generate_series(0, 2999) i;
+ANALYZE pagg_tab_v;
+
+-- Full aggregation as GROUP BY clause matches with PARTITION KEY
+EXPLAIN (COSTS OFF)
+SELECT c, sum(a), count(*) FROM pagg_tab_v GROUP BY c ORDER BY 1;
+SELECT c, sum(a), count(*) FROM pagg_tab_v GROUP BY c ORDER BY 1;
+
+-- Full aggregation also when the GROUP BY clause spells out the cast
+EXPLAIN (COSTS OFF)
+SELECT c::text, sum(a), count(*) FROM pagg_tab_v GROUP BY c::text ORDER BY 1;
+SELECT c::text, sum(a), count(*) FROM pagg_tab_v GROUP BY c::text ORDER BY 1;
+
+
 -- Test with multi-level partitioning scheme
 
 CREATE TABLE pagg_tab_ml (a int, b int, c text) PARTITION BY RANGE(a);

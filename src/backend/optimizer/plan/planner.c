@@ -8534,6 +8534,17 @@ group_by_has_partkey(RelOptInfo *input_rel,
 			Expr	   *partexpr = lfirst(lc);
 			Oid			partcoll = input_rel->part_scheme->partcollation[cnt];
 
+			/*
+			 * Strip any RelabelType decorations, to match the stripping done
+			 * on the grouping expressions below.  A partition key involving a
+			 * binary-compatible cast, such as ((col::text)) on a varchar
+			 * column, is itself stored wrapped in a RelabelType.  The
+			 * collation is not lost, since partcoll and groupcoll are
+			 * compared separately below.
+			 */
+			while (partexpr && IsA(partexpr, RelabelType))
+				partexpr = ((RelabelType *) partexpr)->arg;
+
 			foreach(lg, groupexprs)
 			{
 				Expr	   *groupexpr = lfirst(lg);
